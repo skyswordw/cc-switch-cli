@@ -26,6 +26,22 @@
 
 ---
 
+## 📸 截图预览
+
+### 交互式主界面
+
+<div align="center">
+  <img src="assets/screenshots/main-ch.png" alt="主界面" width="800"/>
+</div>
+
+### 供应商管理
+
+<div align="center">
+  <img src="assets/screenshots/add-ch.png" alt="供应商管理" width="800"/>
+</div>
+
+---
+
 ## ✨ 功能特性
 
 ### 🎯 两种使用模式

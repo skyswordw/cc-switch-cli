@@ -4,11 +4,22 @@ use cc_switch_lib::AppError;
 use std::process;
 
 fn main() {
-    // 初始化日志
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
     // 解析命令行参数
     let cli = Cli::parse();
+
+    // 初始化日志（交互模式下禁用，避免干扰 UI）
+    let log_level = if matches!(cli.command, None | Some(Commands::Interactive)) {
+        if cli.verbose {
+            "info"
+        } else {
+            "error" // 交互模式下只显示错误日志
+        }
+    } else if cli.verbose {
+        "debug"
+    } else {
+        "info"
+    };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level)).init();
 
     // 执行命令
     if let Err(e) = run(cli) {

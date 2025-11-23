@@ -26,6 +26,22 @@ This project is a **CLI fork** of [CC-Switch](https://github.com/farion1231/cc-s
 
 ---
 
+## 📸 Screenshots
+
+### Interactive Main Menu
+
+<div align="center">
+  <img src="assets/screenshots/main-en.png" alt="Main Menu" width="800"/>
+</div>
+
+### Provider Management
+
+<div align="center">
+  <img src="assets/screenshots/add-en.png" alt="Provider Management" width="800"/>
+</div>
+
+---
+
 ## ✨ Features
 
 ### 🎯 Two Usage Modes
