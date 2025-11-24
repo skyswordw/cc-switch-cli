@@ -296,6 +296,86 @@ copy target\release\cc-switch.exe C:\Windows\System32\
 
 ---
 
+## ❓ FAQ (Frequently Asked Questions)
+
+<details>
+<summary><b>Why doesn't my configuration take effect after switching providers?</b></summary>
+
+<br>
+
+This is usually caused by **environment variable conflicts**. If you have API keys set in system environment variables (like `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`), they will override CC-Switch's configuration.
+
+**Solution:**
+
+1. Check for conflicts:
+   ```bash
+   cc-switch env check --app claude
+   ```
+
+2. List all related environment variables:
+   ```bash
+   cc-switch env list --app claude
+   ```
+
+3. If conflicts are found, you can:
+   - Manually remove them from your shell config files (`~/.bashrc`, `~/.zshrc`, etc.)
+   - Or use the unset command (creates automatic backup):
+     ```bash
+     cc-switch env unset ANTHROPIC_API_KEY --app claude
+     ```
+
+4. Restart your terminal for changes to take effect.
+
+</details>
+
+<details>
+<summary><b>How do I restore deleted environment variables?</b></summary>
+
+<br>
+
+All deleted environment variables are automatically backed up to `~/.cc-switch/backups/`.
+
+Check backups:
+```bash
+ls ~/.cc-switch/backups/env-backup-*.json
+```
+
+Backups are stored in JSON format with timestamps for easy restoration if needed.
+
+</details>
+
+<details>
+<summary><b>Which apps are supported?</b></summary>
+
+<br>
+
+CC-Switch currently supports three AI coding assistants:
+- **Claude Code** (`--app claude`, default)
+- **Codex** (`--app codex`)
+- **Gemini** (`--app gemini`)
+
+Use the global `--app` flag to specify which app to manage:
+```bash
+cc-switch --app codex provider list
+```
+
+</details>
+
+<details>
+<summary><b>How do I report bugs or request features?</b></summary>
+
+<br>
+
+Please open an issue on our [GitHub Issues](https://github.com/saladday/cc-switch-cli/issues) page with:
+- Detailed description of the problem or feature request
+- Steps to reproduce (for bugs)
+- Your system information (OS, version)
+- Relevant logs or error messages
+
+</details>
+
+---
+
 ## 🛠️ Development
 
 ### Requirements

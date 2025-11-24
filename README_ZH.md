@@ -296,6 +296,86 @@ copy target\release\cc-switch.exe C:\Windows\System32\
 
 ---
 
+## ❓ 常见问题 (FAQ)
+
+<details>
+<summary><b>为什么切换供应商后配置没有生效？</b></summary>
+
+<br>
+
+这通常是由**环境变量冲突**引起的。如果你在系统环境变量中设置了 API 密钥（如 `ANTHROPIC_API_KEY`、`OPENAI_API_KEY`），它们会覆盖 CC-Switch 的配置。
+
+**解决方案：**
+
+1. 检查冲突：
+   ```bash
+   cc-switch env check --app claude
+   ```
+
+2. 列出所有相关环境变量：
+   ```bash
+   cc-switch env list --app claude
+   ```
+
+3. 如果发现冲突，你可以：
+   - 手动从 shell 配置文件中删除（`~/.bashrc`、`~/.zshrc` 等）
+   - 或使用 unset 命令（会自动创建备份）：
+     ```bash
+     cc-switch env unset ANTHROPIC_API_KEY --app claude
+     ```
+
+4. 重启终端使更改生效。
+
+</details>
+
+<details>
+<summary><b>如何恢复被删除的环境变量？</b></summary>
+
+<br>
+
+所有被删除的环境变量都会自动备份到 `~/.cc-switch/backups/`。
+
+查看备份：
+```bash
+ls ~/.cc-switch/backups/env-backup-*.json
+```
+
+备份以 JSON 格式存储，带有时间戳，方便必要时恢复。
+
+</details>
+
+<details>
+<summary><b>支持哪些应用？</b></summary>
+
+<br>
+
+CC-Switch 目前支持三个 AI 编程助手：
+- **Claude Code** (`--app claude`，默认)
+- **Codex** (`--app codex`)
+- **Gemini** (`--app gemini`)
+
+使用全局 `--app` 参数指定要管理的应用：
+```bash
+cc-switch --app codex provider list
+```
+
+</details>
+
+<details>
+<summary><b>如何报告 bug 或请求新功能？</b></summary>
+
+<br>
+
+请在我们的 [GitHub Issues](https://github.com/saladday/cc-switch-cli/issues) 页面提交问题，并包含：
+- 问题或功能请求的详细描述
+- 复现步骤（针对 bug）
+- 你的系统信息（操作系统、版本）
+- 相关日志或错误信息
+
+</details>
+
+---
+
 ## 🛠️ 开发
 
 ### 环境要求
