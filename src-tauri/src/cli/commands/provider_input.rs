@@ -282,16 +282,32 @@ fn prompt_claude_config(current: Option<&Value>) -> Result<Value, AppError> {
     Ok(json!({ "env": env }))
 }
 
-/// Codex 配置输入（含 TOML 验证）
+/// Codex 配置输入（简化版：只收集基础字段）
 fn prompt_codex_config(current: Option<&Value>) -> Result<Value, AppError> {
     println!("\n{}", texts::config_codex_header().bright_cyan().bold());
 
-    let api_key = if let Some(current_key) = current
+    // 从当前配置提取值
+    let current_api_key = current
         .and_then(|v| v.get("auth"))
         .and_then(|a| a.get("OPENAI_API_KEY"))
         .and_then(|k| k.as_str())
-        .filter(|s| !s.is_empty())
-    {
+        .filter(|s| !s.is_empty());
+
+    let current_config_str = current
+        .and_then(|v| v.get("config"))
+        .and_then(|c| c.as_str());
+
+    let mut current_base_url: Option<String> = None;
+    let mut current_model: Option<String> = None;
+    if let Some(cfg) = current_config_str {
+        if let Ok(table) = toml::from_str::<toml::Table>(cfg) {
+            current_base_url = table.get("base_url").and_then(|v| v.as_str()).map(String::from);
+            current_model = table.get("model").and_then(|v| v.as_str()).map(String::from);
+        }
+    }
+
+    // 1. API Key
+    let api_key = if let Some(current_key) = current_api_key {
         Text::new(texts::openai_api_key_label())
             .with_initial_value(current_key)
             .with_help_message(texts::api_key_help())
@@ -305,50 +321,42 @@ fn prompt_codex_config(current: Option<&Value>) -> Result<Value, AppError> {
             .map_err(|e| AppError::Message(texts::input_failed_error(&e.to_string())))?
     };
 
-    // TOML config 输入
-    let default_toml = current
-        .and_then(|v| v.get("config"))
-        .and_then(|c| c.as_str())
-        .unwrap_or("base_url = \"https://api.openai.com\"\nmodel = \"gpt-4\"");
-
-    println!("\n{}", texts::config_toml_header().yellow());
-    println!("{}", texts::current_config_label().dimmed());
-    for line in default_toml.lines() {
-        println!("  {}", line.dimmed());
-    }
-
-    let use_default = Confirm::new(texts::use_current_config_prompt())
-        .with_default(true)
-        .with_help_message(texts::use_current_config_help())
-        .prompt()
-        .map_err(|e| AppError::Message(texts::input_failed_error(&e.to_string())))?;
-
-    let config_toml = if use_default {
-        default_toml.to_string()
+    // 2. Base URL
+    let base_url = if let Some(current) = current_base_url.as_deref() {
+        Text::new("Base URL:")
+            .with_initial_value(current)
+            .with_help_message("API endpoint (e.g., https://api.openai.com/v1)")
+            .prompt()
+            .map_err(|e| AppError::Message(texts::input_failed_error(&e.to_string())))?
     } else {
-        println!("\n{}", texts::input_toml_config().yellow());
-        let mut lines = Vec::new();
-        loop {
-            let line = Text::new("")
-                .with_help_message(texts::direct_enter_to_finish())
-                .prompt()
-                .map_err(|e| AppError::Message(texts::input_failed_error(&e.to_string())))?;
-            if line.trim().is_empty() && !lines.is_empty() {
-                break;
-            }
-            if !line.trim().is_empty() {
-                lines.push(line);
-            }
-        }
-        if lines.is_empty() {
-            default_toml.to_string()
-        } else {
-            lines.join("\n")
-        }
+        Text::new("Base URL:")
+            .with_placeholder("https://api.openai.com/v1")
+            .with_help_message("API endpoint")
+            .prompt()
+            .map_err(|e| AppError::Message(texts::input_failed_error(&e.to_string())))?
     };
 
-    // 验证 TOML 格式
-    codex_config::validate_config_toml(&config_toml)?;
+    // 3. Model
+    let model = if let Some(current) = current_model.as_deref() {
+        Text::new("Model:")
+            .with_initial_value(current)
+            .with_help_message("Model name (e.g., gpt-4, gpt-5.1-codex)")
+            .prompt()
+            .map_err(|e| AppError::Message(texts::input_failed_error(&e.to_string())))?
+    } else {
+        Text::new("Model:")
+            .with_placeholder("gpt-4")
+            .with_help_message("Model name")
+            .prompt()
+            .map_err(|e| AppError::Message(texts::input_failed_error(&e.to_string())))?
+    };
+
+    // 构建 TOML 配置
+    let config_toml = format!(
+        "base_url = \"{}\"\nmodel = \"{}\"",
+        base_url.trim(),
+        model.trim()
+    );
 
     Ok(json!({
         "auth": { "OPENAI_API_KEY": api_key.trim() },

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::app_config::{AppType, MultiAppConfig};
-use crate::codex_config::{get_codex_auth_path, get_codex_config_path, write_codex_live_atomic};
+use crate::codex_config::{get_codex_auth_path, get_codex_config_path};
 use crate::config::{
     delete_file, get_claude_settings_path, get_provider_config_path, read_json_file,
     write_json_file, write_text_file,
@@ -18,6 +18,15 @@ use crate::usage_script;
 
 /// 供应商相关业务逻辑
 pub struct ProviderService;
+
+/// 从供应商名称生成 Codex 的 provider ID (lowercase alphanumeric)
+/// 示例: "Duck Coding" -> "duckcoding"
+fn generate_provider_id_from_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect::<String>()
+        .to_lowercase()
+}
 
 #[derive(Clone)]
 enum LiveSnapshot {
@@ -1393,6 +1402,8 @@ impl ProviderService {
     }
 
     fn write_codex_live(provider: &Provider) -> Result<(), AppError> {
+        use toml_edit::{value, Item, Table};
+
         let settings = provider
             .settings_config
             .as_object()
@@ -1406,10 +1417,120 @@ impl ProviderService {
                 provider.id
             )));
         }
-        let cfg_text = settings.get("config").and_then(Value::as_str);
 
-        write_codex_live_atomic(auth, cfg_text)?;
+        // 获取存储的 config TOML 文本
+        let cfg_text = settings
+            .get("config")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+
+        // 解析存储的 TOML 以提取字段（如果为空则使用默认值）
+        let stored_config: toml::Table = if cfg_text.trim().is_empty() {
+            toml::Table::new()
+        } else {
+            toml::from_str(cfg_text).map_err(|e| {
+                AppError::Config(format!("解析供应商 {} 的 config TOML 失败: {}", provider.id, e))
+            })?
+        };
+
+        // 提取必要字段
+        let base_url = stored_config
+            .get("base_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let model = stored_config
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("gpt-4");
+        let wire_api = stored_config
+            .get("wire_api")
+            .and_then(|v| v.as_str())
+            .unwrap_or("chat"); // 默认 'chat'
+        let env_key = stored_config
+            .get("env_key")
+            .and_then(|v| v.as_str())
+            .unwrap_or("OPENAI_API_KEY");
+
+        // 从供应商名称生成 provider ID
+        let provider_id = generate_provider_id_from_name(&provider.name);
+
+        // 读取现有 config.toml（保留 MCP 服务器等其他配置）
+        let base_text = crate::codex_config::read_and_validate_codex_config_text()?;
+        let mut doc = if base_text.trim().is_empty() {
+            toml_edit::DocumentMut::default()
+        } else {
+            base_text.parse::<toml_edit::DocumentMut>().map_err(|e| {
+                AppError::Config(format!("解析 config.toml 失败: {}", e))
+            })?
+        };
+
+        // 移除不应该在根级别的字段
+        doc.as_table_mut().remove("base_url");
+        doc.as_table_mut().remove("wire_api");
+        doc.as_table_mut().remove("env_key");
+
+        // 设置根级别字段
+        doc["model_provider"] = value(&provider_id);
+        doc["model"] = value(model);
+
+        // 从 stored_config 复制其他根级别字段（如果有）
+        for (key, val) in stored_config.iter() {
+            match key.as_str() {
+                // 跳过已处理的字段和应该在 provider section 的字段
+                "base_url" | "wire_api" | "env_key" | "name" => continue,
+                "model" => continue, // 已在上面设置
+                // 复制其他根级别字段（如 model_reasoning_effort, network_access 等）
+                _ => {
+                    if let Some(toml_val) = Self::toml_value_to_toml_edit_value(val) {
+                        doc[key] = Item::Value(toml_val);
+                    }
+                }
+            }
+        }
+
+        // 构建 [model_providers.<id>] 表
+        let mut provider_table = Table::new();
+        provider_table["name"] = value(&provider_id);
+        if !base_url.is_empty() {
+            provider_table["base_url"] = value(base_url);
+        }
+        provider_table["wire_api"] = value(wire_api);
+        provider_table["env_key"] = value(env_key);
+
+        // 确保 model_providers 表存在
+        if !doc.contains_key("model_providers") {
+            doc["model_providers"] = Item::Table(Table::new());
+        }
+
+        // 设置 provider
+        if let Some(providers_item) = doc.get_mut("model_providers") {
+            if let Some(providers_table) = providers_item.as_table_like_mut() {
+                providers_table.insert(&provider_id, Item::Table(provider_table));
+            }
+        }
+
+        // 写回 config.toml
+        let new_text = doc.to_string();
+        let config_path = get_codex_config_path();
+        crate::config::write_text_file(&config_path, &new_text)?;
+
+        // 写 auth.json
+        let auth_path = get_codex_auth_path();
+        write_json_file(&auth_path, auth)?;
+
         Ok(())
+    }
+
+    /// 将 toml::Value 转换为 toml_edit::Value
+    fn toml_value_to_toml_edit_value(val: &toml::Value) -> Option<toml_edit::Value> {
+        use toml_edit::Value as EditValue;
+        match val {
+            toml::Value::String(s) => Some(EditValue::from(s.as_str())),
+            toml::Value::Integer(i) => Some(EditValue::from(*i)),
+            toml::Value::Float(f) => Some(EditValue::from(*f)),
+            toml::Value::Boolean(b) => Some(EditValue::from(*b)),
+            _ => None, // 暂不处理数组和表
+        }
     }
 
     fn prepare_switch_claude(
