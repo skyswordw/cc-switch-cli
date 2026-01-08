@@ -7,6 +7,13 @@ All notable changes to CC Switch CLI will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.2.8] - 2026-01-08
+
+### Fixed
+
+- **Providers**: The “Official provider” add mode is now Codex-only (Claude Code uses third-party flow only).
+- **Codex (Official provider)**: Skip prompts for website URL / model / wire API; uses `requires_openai_auth = true` and `wire_api = "responses"` by default.
+
 ## [4.2.7] - 2026-01-08
 
 ### Added
