@@ -4,7 +4,8 @@ use std::sync::RwLock;
 use crate::app_config::{AppType, MultiAppConfig};
 use crate::cli::commands::provider_input::{
     current_timestamp, display_provider_summary, generate_provider_id, prompt_basic_fields,
-    prompt_optional_fields, prompt_settings_config, OptionalFields,
+    prompt_optional_fields, prompt_settings_config, prompt_settings_config_for_add, OptionalFields,
+    ProviderAddMode,
 };
 use crate::cli::i18n::texts;
 use crate::cli::ui::{create_table, error, highlight, info, success, warning};
@@ -12,7 +13,7 @@ use crate::error::AppError;
 use crate::provider::Provider;
 use crate::services::{ProviderService, SpeedtestService};
 use crate::store::AppState;
-use inquire::Confirm;
+use inquire::{Confirm, Select};
 
 #[derive(Subcommand)]
 pub enum ProviderCommand {
@@ -253,6 +254,27 @@ fn add_provider(app_type: AppType) -> Result<(), AppError> {
     println!("{}", highlight("Add New Provider"));
     println!("{}", "=".repeat(50));
 
+    let add_mode = if matches!(app_type, AppType::Claude | AppType::Codex) {
+        let choices = vec![
+            texts::add_official_provider(),
+            texts::add_third_party_provider(),
+        ];
+        match Select::new(texts::select_provider_add_mode(), choices.clone()).prompt() {
+            Ok(selected) if selected == texts::add_official_provider() => ProviderAddMode::Official,
+            Ok(_selected) => ProviderAddMode::ThirdParty,
+            Err(inquire::error::InquireError::OperationCanceled)
+            | Err(inquire::error::InquireError::OperationInterrupted) => {
+                println!("{}", info(texts::cancelled()));
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(AppError::Message(texts::input_failed_error(&e.to_string())));
+            }
+        }
+    } else {
+        ProviderAddMode::ThirdParty
+    };
+
     // 1. 加载配置和状态
     let state = AppState {
         config: RwLock::new(MultiAppConfig::load()?),
@@ -270,7 +292,7 @@ fn add_provider(app_type: AppType) -> Result<(), AppError> {
     println!("{}", info(&texts::generated_id_message(&id)));
 
     // 3. 收集配置
-    let settings_config = prompt_settings_config(&app_type, None)?;
+    let settings_config = prompt_settings_config_for_add(&app_type, add_mode)?;
 
     // 4. 询问是否配置可选字段
     let optional = if Confirm::new(texts::configure_optional_fields_prompt())

@@ -10,6 +10,93 @@ use inquire::{Confirm, Select, Text};
 use serde_json::{json, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const CLAUDE_OFFICIAL_BASE_URL: &str = "https://api.anthropic.com";
+const CODEX_OFFICIAL_BASE_URL: &str = "https://api.openai.com/v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderAddMode {
+    Official,
+    ThirdParty,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_official_settings_config_omits_auth_and_enables_openai_auth() {
+        let cfg = build_codex_official_settings_config("gpt-4o", "chat");
+        assert!(
+            cfg.get("auth").is_none(),
+            "official Codex provider should not require auth.json"
+        );
+
+        let toml_text = cfg
+            .get("config")
+            .and_then(Value::as_str)
+            .expect("settings_config.config should be string");
+        assert!(
+            toml_text.contains("requires_openai_auth = true"),
+            "official Codex provider should enable requires_openai_auth"
+        );
+    }
+
+    #[test]
+    fn claude_official_settings_config_sets_official_base_url() {
+        let cfg = build_claude_official_settings_config("sk-ant-test");
+        let env = cfg
+            .get("env")
+            .and_then(Value::as_object)
+            .expect("settings_config.env should be object");
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL").and_then(Value::as_str),
+            Some("https://api.anthropic.com"),
+            "official Claude provider should use official base url"
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_AUTH_TOKEN").and_then(Value::as_str),
+            Some("sk-ant-test"),
+            "official Claude provider should preserve api key"
+        );
+    }
+}
+
+pub fn prompt_settings_config_for_add(
+    app_type: &AppType,
+    mode: ProviderAddMode,
+) -> Result<Value, AppError> {
+    match (app_type, mode) {
+        (AppType::Claude, ProviderAddMode::Official) => prompt_claude_official_config(),
+        (AppType::Claude, ProviderAddMode::ThirdParty) => prompt_claude_config(None),
+        (AppType::Codex, ProviderAddMode::Official) => prompt_codex_official_config(),
+        (AppType::Codex, ProviderAddMode::ThirdParty) => prompt_codex_config(None),
+        (AppType::Gemini, _) => prompt_gemini_config(None),
+    }
+}
+
+fn build_codex_official_settings_config(model: &str, wire_api: &str) -> Value {
+    let config_toml = [
+        format!("base_url = \"{}\"", CODEX_OFFICIAL_BASE_URL),
+        format!("model = \"{}\"", model.trim()),
+        format!("wire_api = \"{}\"", wire_api.trim()),
+        "requires_openai_auth = true".to_string(),
+    ]
+    .join("\n");
+
+    json!({
+        "config": config_toml
+    })
+}
+
+fn build_claude_official_settings_config(api_key: &str) -> Value {
+    json!({
+        "env": {
+            "ANTHROPIC_AUTH_TOKEN": api_key.trim(),
+            "ANTHROPIC_BASE_URL": CLAUDE_OFFICIAL_BASE_URL
+        }
+    })
+}
+
 /// 可选字段集合
 #[derive(Default)]
 pub struct OptionalFields {
@@ -290,6 +377,72 @@ fn prompt_claude_config(current: Option<&Value>) -> Result<Value, AppError> {
     Ok(json!({ "env": env }))
 }
 
+fn prompt_claude_official_config() -> Result<Value, AppError> {
+    println!("\n{}", texts::config_claude_header().bright_cyan().bold());
+
+    let api_key = Text::new(texts::api_key_label())
+        .with_placeholder("sk-ant-...")
+        .with_help_message(texts::api_key_help())
+        .prompt()
+        .map_err(|e| AppError::Message(texts::input_failed_error(&e.to_string())))?;
+
+    // 询问是否配置模型
+    let config_models = Confirm::new(texts::configure_model_names_prompt())
+        .with_default(false)
+        .with_help_message(texts::api_key_help())
+        .prompt()
+        .map_err(|e| AppError::Message(texts::input_failed_error(&e.to_string())))?;
+
+    let mut cfg = build_claude_official_settings_config(&api_key);
+
+    if config_models {
+        let env = cfg
+            .get_mut("env")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| AppError::Message("Invalid Claude config env structure".to_string()))?;
+
+        let model = prompt_model_field(
+            texts::model_default_label(),
+            "ANTHROPIC_MODEL",
+            texts::model_sonnet_placeholder(),
+            None,
+        )?;
+        let haiku = prompt_model_field(
+            texts::model_haiku_label(),
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            texts::model_haiku_placeholder(),
+            None,
+        )?;
+        let sonnet = prompt_model_field(
+            texts::model_sonnet_label(),
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            texts::model_sonnet_placeholder(),
+            None,
+        )?;
+        let opus = prompt_model_field(
+            texts::model_opus_label(),
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            texts::model_opus_placeholder(),
+            None,
+        )?;
+
+        if let Some(value) = model {
+            env.insert("ANTHROPIC_MODEL".to_string(), json!(value));
+        }
+        if let Some(value) = haiku {
+            env.insert("ANTHROPIC_DEFAULT_HAIKU_MODEL".to_string(), json!(value));
+        }
+        if let Some(value) = sonnet {
+            env.insert("ANTHROPIC_DEFAULT_SONNET_MODEL".to_string(), json!(value));
+        }
+        if let Some(value) = opus {
+            env.insert("ANTHROPIC_DEFAULT_OPUS_MODEL".to_string(), json!(value));
+        }
+    }
+
+    Ok(cfg)
+}
+
 /// Codex 配置输入（双写模式：同时支持旧版本和 0.64+）
 fn prompt_codex_config(current: Option<&Value>) -> Result<Value, AppError> {
     println!("\n{}", texts::config_codex_header().bright_cyan().bold());
@@ -459,6 +612,26 @@ fn prompt_codex_config(current: Option<&Value>) -> Result<Value, AppError> {
         "auth": { "OPENAI_API_KEY": api_key.trim() },
         "config": config_toml
     }))
+}
+
+fn prompt_codex_official_config() -> Result<Value, AppError> {
+    println!("\n{}", texts::config_codex_header().bright_cyan().bold());
+    println!("\n{}", texts::codex_official_provider_tip().yellow());
+
+    let model = Text::new("Model:")
+        .with_placeholder("gpt-4")
+        .with_help_message("Model name (e.g., gpt-4, o3)")
+        .prompt()
+        .map_err(|e| AppError::Message(texts::input_failed_error(&e.to_string())))?;
+
+    let wire_api_options = vec!["chat", "responses"];
+    let wire_api = Select::new(texts::codex_wire_api_label(), wire_api_options)
+        .with_starting_cursor(0)
+        .with_help_message(texts::codex_wire_api_help())
+        .prompt()
+        .map_err(|e| AppError::Message(texts::input_failed_error(&e.to_string())))?;
+
+    Ok(build_codex_official_settings_config(model.trim(), wire_api))
 }
 
 /// Gemini 配置输入（含认证类型选择）

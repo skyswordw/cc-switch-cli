@@ -360,6 +360,30 @@ pub mod texts {
         }
     }
 
+    pub fn add_official_provider() -> &'static str {
+        if is_chinese() {
+            "添加官方供应商"
+        } else {
+            "Add Official Provider"
+        }
+    }
+
+    pub fn add_third_party_provider() -> &'static str {
+        if is_chinese() {
+            "添加第三方供应商"
+        } else {
+            "Add Third-Party Provider"
+        }
+    }
+
+    pub fn select_provider_add_mode() -> &'static str {
+        if is_chinese() {
+            "请选择供应商类型："
+        } else {
+            "Select provider type:"
+        }
+    }
+
     pub fn delete_provider() -> &'static str {
         if is_chinese() {
             "🗑️  删除供应商"
@@ -835,6 +859,14 @@ pub mod texts {
             "环境变量（env_key，需要手动 export）"
         } else {
             "Environment variable (env_key, requires export)"
+        }
+    }
+
+    pub fn codex_official_provider_tip() -> &'static str {
+        if is_chinese() {
+            "提示：官方供应商将使用 Codex 官方登录保存的凭证（codex login 可能会打开浏览器），无需填写 API Key"
+        } else {
+            "Tip: Official provider uses Codex login credentials (`codex login` may open a browser); no API key required"
         }
     }
 
