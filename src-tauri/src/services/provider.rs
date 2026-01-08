@@ -163,6 +163,79 @@ mod tests {
 
     #[test]
     #[serial]
+    fn switch_codex_succeeds_without_auth_json() {
+        let temp_home = TempDir::new().expect("create temp home");
+        let _env = EnvGuard::set_home(temp_home.path());
+
+        let mut config = MultiAppConfig::default();
+        config.ensure_app(&AppType::Codex);
+        {
+            let manager = config
+                .get_manager_mut(&AppType::Codex)
+                .expect("codex manager");
+            manager.current = "p2".to_string();
+            manager.providers.insert(
+                "p1".to_string(),
+                Provider::with_id(
+                    "p1".to_string(),
+                    "Keyring".to_string(),
+                    json!({
+                        "config": "requires_openai_auth = true\n",
+                    }),
+                    None,
+                ),
+            );
+            manager.providers.insert(
+                "p2".to_string(),
+                Provider::with_id(
+                    "p2".to_string(),
+                    "Other".to_string(),
+                    json!({
+                        "config": "requires_openai_auth = true\n",
+                    }),
+                    None,
+                ),
+            );
+        }
+
+        let state = AppState {
+            config: RwLock::new(config),
+        };
+
+        ProviderService::switch(&state, AppType::Codex, "p1")
+            .expect("switch should succeed without auth.json when using credential store");
+
+        assert!(
+            !get_codex_auth_path().exists(),
+            "auth.json should remain absent when provider has no auth config"
+        );
+
+        let live_config_text =
+            std::fs::read_to_string(get_codex_config_path()).expect("read live config.toml");
+
+        let guard = state.config.read().expect("read config after switch");
+        let manager = guard
+            .get_manager(&AppType::Codex)
+            .expect("codex manager after switch");
+        assert_eq!(manager.current, "p1", "current provider should update");
+        let provider = manager.providers.get("p1").expect("p1 exists");
+        assert!(
+            provider.settings_config.get("auth").is_none(),
+            "snapshot should not inject auth when auth.json is absent"
+        );
+        assert_eq!(
+            provider
+                .settings_config
+                .get("config")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            live_config_text,
+            "provider snapshot should match live config.toml even without auth.json"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn add_first_provider_sets_current() {
         let temp_home = TempDir::new().expect("create temp home");
         let _env = EnvGuard::set_home(temp_home.path());
@@ -861,14 +934,11 @@ impl ProviderService {
             }
             AppType::Codex => {
                 let auth_path = get_codex_auth_path();
-                if !auth_path.exists() {
-                    return Err(AppError::localized(
-                        "codex.live.missing",
-                        "Codex auth.json 不存在，无法刷新快照",
-                        "Codex auth.json missing; cannot refresh snapshot",
-                    ));
-                }
-                let auth: Value = read_json_file(&auth_path)?;
+                let auth = if auth_path.exists() {
+                    Some(read_json_file::<Value>(&auth_path)?)
+                } else {
+                    None
+                };
                 let cfg_text = crate::codex_config::read_and_validate_codex_config_text()?;
 
                 {
@@ -880,7 +950,9 @@ impl ProviderService {
                                     "供应商 {provider_id} 的 Codex 配置必须是 JSON 对象"
                                 ))
                             })?;
-                            obj.insert("auth".to_string(), auth.clone());
+                            if let Some(auth) = auth {
+                                obj.insert("auth".to_string(), auth);
+                            }
                             obj.insert("config".to_string(), Value::String(cfg_text.clone()));
                         }
                     }

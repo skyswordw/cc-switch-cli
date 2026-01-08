@@ -3,8 +3,8 @@ use std::sync::RwLock;
 
 use crate::app_config::{AppType, MultiAppConfig};
 use crate::cli::commands::provider_input::{
-    current_timestamp, display_provider_summary, generate_provider_id,
-    prompt_basic_fields, prompt_optional_fields, prompt_settings_config, OptionalFields,
+    current_timestamp, display_provider_summary, generate_provider_id, prompt_basic_fields,
+    prompt_optional_fields, prompt_settings_config, OptionalFields,
 };
 use crate::cli::i18n::texts;
 use crate::cli::ui::{create_table, error, highlight, info, success, warning};
@@ -134,8 +134,16 @@ fn show_current(app_type: AppType) -> Result<(), AppError> {
     // 基本信息
     println!("\n{}", highlight(texts::basic_info_section_header()));
     println!("  ID:       {}", current_id);
-    println!("  {}:     {}", texts::name_label_with_colon(), provider.name);
-    println!("  {}:     {}", texts::app_label_with_colon(), app_type.as_str());
+    println!(
+        "  {}:     {}",
+        texts::name_label_with_colon(),
+        provider.name
+    );
+    println!(
+        "  {}:     {}",
+        texts::app_label_with_colon(),
+        app_type.as_str()
+    );
 
     // 仅 Claude 应用显示详细配置
     if matches!(app_type, AppType::Claude) {
@@ -305,7 +313,10 @@ fn add_provider(app_type: AppType) -> Result<(), AppError> {
     ProviderService::add(&state, app_type.clone(), provider)?;
 
     // 8. 成功消息
-    println!("\n{}", success(&texts::entity_added_success(texts::entity_provider(), &id)));
+    println!(
+        "\n{}",
+        success(&texts::entity_added_success(texts::entity_provider(), &id))
+    );
 
     Ok(())
 }
@@ -327,11 +338,7 @@ fn edit_provider(app_type: AppType, id: &str) -> Result<(), AppError> {
         .get(id)
         .ok_or_else(|| {
             let msg = texts::entity_not_found(texts::entity_provider(), id);
-            AppError::localized(
-                "provider.not_found",
-                msg.clone(),
-                msg,
-            )
+            AppError::localized("provider.not_found", msg.clone(), msg)
         })?
         .clone();
     let is_current = manager.current == id;
@@ -401,12 +408,12 @@ fn edit_provider(app_type: AppType, id: &str) -> Result<(), AppError> {
     ProviderService::update(&state, app_type.clone(), updated)?;
 
     // 9. 成功消息
-    println!("\n{}", success(&texts::entity_updated_success(texts::entity_provider(), id)));
+    println!(
+        "\n{}",
+        success(&texts::entity_updated_success(texts::entity_provider(), id))
+    );
     if is_current {
-        println!(
-            "{}",
-            warning(texts::current_provider_synced_warning())
-        );
+        println!("{}", warning(texts::current_provider_synced_warning()));
     }
 
     Ok(())
@@ -431,7 +438,10 @@ fn speedtest_provider(app_type: AppType, id: &str) -> Result<(), AppError> {
     let api_url = extract_api_url(&provider.settings_config, &app_type)
         .ok_or_else(|| AppError::Message(format!("No API URL configured for provider '{}'", id)))?;
 
-    println!("{}", info(&format!("Testing provider '{}'...", provider.name)));
+    println!(
+        "{}",
+        info(&format!("Testing provider '{}'...", provider.name))
+    );
     println!("{}", info(&format!("Endpoint: {}", api_url)));
     println!();
 
@@ -439,9 +449,8 @@ fn speedtest_provider(app_type: AppType, id: &str) -> Result<(), AppError> {
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|e| AppError::Message(format!("Failed to create async runtime: {}", e)))?;
 
-    let results = runtime.block_on(async {
-        SpeedtestService::test_endpoints(vec![api_url.clone()], None).await
-    })?;
+    let results = runtime
+        .block_on(async { SpeedtestService::test_endpoints(vec![api_url.clone()], None).await })?;
 
     // Display results
     if let Some(result) = results.first() {
@@ -456,15 +465,12 @@ fn speedtest_provider(app_type: AppType, id: &str) -> Result<(), AppError> {
             "Timeout".to_string()
         };
 
-        let status_str = result.status
+        let status_str = result
+            .status
             .map(|s| s.to_string())
             .unwrap_or_else(|| "N/A".to_string());
 
-        table.add_row(vec![
-            result.url.clone(),
-            latency_str,
-            status_str,
-        ]);
+        table.add_row(vec![result.url.clone(), latency_str, status_str]);
 
         println!("{}", table);
 

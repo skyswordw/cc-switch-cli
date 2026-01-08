@@ -38,12 +38,14 @@ pub fn generate_provider_id(name: &str, existing_ids: &[String]) -> String {
     let base_id = name
         .to_lowercase()
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' {
-            c
-        } else if c.is_whitespace() {
-            '-'
-        } else {
-            '-'
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else if c.is_whitespace() {
+                '-'
+            } else {
+                '-'
+            }
         })
         .collect::<String>()
         .trim_matches('-')
@@ -66,7 +68,9 @@ pub fn generate_provider_id(name: &str, existing_ids: &[String]) -> String {
 }
 
 /// 收集基本字段：name, website_url
-pub fn prompt_basic_fields(current: Option<&Provider>) -> Result<(String, Option<String>), AppError> {
+pub fn prompt_basic_fields(
+    current: Option<&Provider>,
+) -> Result<(String, Option<String>), AppError> {
     // 供应商名称：根据上下文选择方法
     let name = if let Some(provider) = current {
         // 编辑模式：预填充当前值
@@ -86,7 +90,9 @@ pub fn prompt_basic_fields(current: Option<&Provider>) -> Result<(String, Option
 
     let name = name.trim().to_string();
     if name.is_empty() {
-        return Err(AppError::InvalidInput(texts::provider_name_empty_error().to_string()));
+        return Err(AppError::InvalidInput(
+            texts::provider_name_empty_error().to_string(),
+        ));
     }
 
     // 官网 URL：同样处理
@@ -115,7 +121,10 @@ pub fn prompt_basic_fields(current: Option<&Provider>) -> Result<(String, Option
 }
 
 /// 根据应用类型收集 settings_config
-pub fn prompt_settings_config(app_type: &AppType, current: Option<&Value>) -> Result<Value, AppError> {
+pub fn prompt_settings_config(
+    app_type: &AppType,
+    current: Option<&Value>,
+) -> Result<Value, AppError> {
     match app_type {
         AppType::Claude => prompt_claude_config(current),
         AppType::Codex => prompt_codex_config(current),
@@ -303,13 +312,24 @@ fn prompt_codex_config(current: Option<&Value>) -> Result<Value, AppError> {
     let mut current_requires_openai_auth: Option<bool> = None;
     if let Some(cfg) = current_config_str {
         if let Ok(table) = toml::from_str::<toml::Table>(cfg) {
-            current_base_url = table.get("base_url").and_then(|v| v.as_str()).map(String::from);
-            current_model = table.get("model").and_then(|v| v.as_str()).map(String::from);
-            current_env_key = table.get("env_key").and_then(|v| v.as_str()).map(String::from);
-            current_wire_api = table.get("wire_api").and_then(|v| v.as_str()).map(String::from);
-            current_requires_openai_auth = table
-                .get("requires_openai_auth")
-                .and_then(|v| v.as_bool());
+            current_base_url = table
+                .get("base_url")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            current_model = table
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            current_env_key = table
+                .get("env_key")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            current_wire_api = table
+                .get("wire_api")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            current_requires_openai_auth =
+                table.get("requires_openai_auth").and_then(|v| v.as_bool());
         }
     }
 
@@ -452,10 +472,7 @@ fn prompt_gemini_config(current: Option<&Value>) -> Result<Value, AppError> {
         _ => 1, // 默认 Generic API Key（包括 packycode 和 generic）
     };
 
-    let auth_options = vec![
-        texts::google_oauth_official(),
-        texts::generic_api_key(),
-    ];
+    let auth_options = vec![texts::google_oauth_official(), texts::generic_api_key()];
 
     let auth_type = Select::new(texts::auth_type_label(), auth_options.clone())
         .with_starting_cursor(default_index)
@@ -540,10 +557,17 @@ pub fn prompt_optional_fields(current: Option<&Provider>) -> Result<OptionalFiel
             .prompt()
             .map_err(|e| AppError::Message(texts::input_failed_error(&e.to_string())))?
     };
-    let notes = if notes.trim().is_empty() { None } else { Some(notes.trim().to_string()) };
+    let notes = if notes.trim().is_empty() {
+        None
+    } else {
+        Some(notes.trim().to_string())
+    };
 
     let sort_index_str = if let Some(provider) = current {
-        let initial = provider.sort_index.map(|i| i.to_string()).unwrap_or_default();
+        let initial = provider
+            .sort_index
+            .map(|i| i.to_string())
+            .unwrap_or_default();
         Text::new(texts::sort_index_label())
             .with_initial_value(&initial)
             .with_help_message(texts::sort_index_help_edit())
@@ -556,12 +580,14 @@ pub fn prompt_optional_fields(current: Option<&Provider>) -> Result<OptionalFiel
             .prompt()
             .map_err(|e| AppError::Message(texts::input_failed_error(&e.to_string())))?
     };
-    let sort_index = if sort_index_str.trim().is_empty() {
-        None
-    } else {
-        Some(sort_index_str.trim().parse::<usize>()
-            .map_err(|_| AppError::InvalidInput(texts::invalid_sort_index_number().to_string()))?)
-    };
+    let sort_index =
+        if sort_index_str.trim().is_empty() {
+            None
+        } else {
+            Some(sort_index_str.trim().parse::<usize>().map_err(|_| {
+                AppError::InvalidInput(texts::invalid_sort_index_number().to_string())
+            })?)
+        };
 
     Ok(OptionalFields {
         notes,
@@ -573,9 +599,16 @@ pub fn prompt_optional_fields(current: Option<&Provider>) -> Result<OptionalFiel
 
 /// 显示供应商配置摘要
 pub fn display_provider_summary(provider: &Provider, app_type: &AppType) {
-    println!("\n{}", texts::provider_config_summary().bright_green().bold());
+    println!(
+        "\n{}",
+        texts::provider_config_summary().bright_green().bold()
+    );
     println!("{}: {}", texts::id_label().bright_yellow(), provider.id);
-    println!("{}: {}", texts::provider_name_label().bright_yellow(), provider.name);
+    println!(
+        "{}: {}",
+        texts::provider_name_label().bright_yellow(),
+        provider.name
+    );
 
     if let Some(website) = &provider.website_url {
         println!("{}: {}", texts::website_label().bright_yellow(), website);
@@ -587,7 +620,11 @@ pub fn display_provider_summary(provider: &Provider, app_type: &AppType) {
         AppType::Claude => {
             if let Some(env) = provider.settings_config.get("env") {
                 if let Some(api_key) = env.get("ANTHROPIC_AUTH_TOKEN").and_then(|v| v.as_str()) {
-                    println!("  {}: {}", texts::api_key_display_label(), mask_api_key(api_key));
+                    println!(
+                        "  {}: {}",
+                        texts::api_key_display_label(),
+                        mask_api_key(api_key)
+                    );
                 }
                 if let Some(base_url) = env.get("ANTHROPIC_BASE_URL").and_then(|v| v.as_str()) {
                     println!("  {}: {}", texts::base_url_display_label(), base_url);
@@ -596,29 +633,43 @@ pub fn display_provider_summary(provider: &Provider, app_type: &AppType) {
                     println!("  {}: {}", texts::model_label(), model);
                 }
             }
-        },
+        }
         AppType::Codex => {
             if let Some(auth) = provider.settings_config.get("auth") {
                 if let Some(api_key) = auth.get("OPENAI_API_KEY").and_then(|v| v.as_str()) {
-                    println!("  {}: {}", texts::api_key_display_label(), mask_api_key(api_key));
+                    println!(
+                        "  {}: {}",
+                        texts::api_key_display_label(),
+                        mask_api_key(api_key)
+                    );
                 }
             }
-            if let Some(config) = provider.settings_config.get("config").and_then(|v| v.as_str()) {
+            if let Some(config) = provider
+                .settings_config
+                .get("config")
+                .and_then(|v| v.as_str())
+            {
                 println!("  {}", texts::config_toml_lines(config.lines().count()));
             }
-        },
+        }
         AppType::Gemini => {
             if let Some(env) = provider.settings_config.get("env") {
                 if let Some(api_key) = env.get("GEMINI_API_KEY").and_then(|v| v.as_str()) {
-                    println!("  {}: {}", texts::api_key_display_label(), mask_api_key(api_key));
+                    println!(
+                        "  {}: {}",
+                        texts::api_key_display_label(),
+                        mask_api_key(api_key)
+                    );
                 }
-                if let Some(base_url) = env.get("GOOGLE_GEMINI_BASE_URL")
+                if let Some(base_url) = env
+                    .get("GOOGLE_GEMINI_BASE_URL")
                     .or_else(|| env.get("BASE_URL"))
-                    .and_then(|v| v.as_str()) {
+                    .and_then(|v| v.as_str())
+                {
                     println!("  {}: {}", texts::base_url_display_label(), base_url);
                 }
             }
-        },
+        }
     }
 
     // 可选字段
@@ -648,8 +699,12 @@ pub fn current_timestamp() -> i64 {
 fn detect_gemini_auth_type(value: Option<&Value>) -> Option<String> {
     if let Some(env) = value.and_then(|v| v.get("env")) {
         if env.get("GEMINI_API_KEY").is_some() {
-            if env.get("GOOGLE_GEMINI_BASE_URL").and_then(|v| v.as_str())
-                .map(|s| s.contains("packycode")).unwrap_or(false) {
+            if env
+                .get("GOOGLE_GEMINI_BASE_URL")
+                .and_then(|v| v.as_str())
+                .map(|s| s.contains("packycode"))
+                .unwrap_or(false)
+            {
                 return Some("packycode".to_string());
             } else {
                 return Some("generic".to_string());
@@ -657,7 +712,11 @@ fn detect_gemini_auth_type(value: Option<&Value>) -> Option<String> {
         }
     }
     // 如果没有 API Key，假设是 OAuth
-    if value.and_then(|v| v.get("env")).map(|v| v.as_object().map(|o| o.is_empty()).unwrap_or(true)).unwrap_or(true) {
+    if value
+        .and_then(|v| v.get("env"))
+        .map(|v| v.as_object().map(|o| o.is_empty()).unwrap_or(true))
+        .unwrap_or(true)
+    {
         return Some("oauth".to_string());
     }
     None
@@ -668,5 +727,5 @@ fn mask_api_key(key: &str) -> String {
     if key.len() <= 8 {
         return "***".to_string();
     }
-    format!("{}...{}", &key[..4], &key[key.len()-4..])
+    format!("{}...{}", &key[..4], &key[key.len() - 4..])
 }
