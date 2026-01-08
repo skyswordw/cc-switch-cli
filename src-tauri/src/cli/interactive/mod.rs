@@ -9,7 +9,7 @@ use std::io::IsTerminal;
 
 use crate::app_config::AppType;
 use crate::cli::i18n::texts;
-use crate::cli::ui::{error, highlight, info, success};
+use crate::cli::ui::{error, highlight, info, set_tui_theme_app, success};
 use crate::error::AppError;
 use crate::services::{McpService, PromptService, ProviderService};
 
@@ -17,6 +17,7 @@ use utils::{app_switch_direction_from_key, clear_screen, cycle_app_type, pause, 
 
 pub fn run(app: Option<AppType>) -> Result<(), AppError> {
     let mut app_type = app.unwrap_or(AppType::Claude);
+    set_tui_theme_app(Some(app_type.clone()));
 
     loop {
         match show_main_menu(&mut app_type)? {
@@ -64,6 +65,7 @@ pub fn run(app: Option<AppType>) -> Result<(), AppError> {
             MainMenuChoice::Exit => {
                 clear_screen();
                 println!("{}\n", success(texts::goodbye()));
+                set_tui_theme_app(None);
                 break;
             }
         }
@@ -137,6 +139,7 @@ fn show_main_menu(app_type: &mut AppType) -> Result<MainMenuChoice, AppError> {
 
     loop {
         clear_screen();
+        set_tui_theme_app(Some(app_type.clone()));
         print_welcome(app_type);
 
         println!("{}", texts::main_menu_prompt(app_type.as_str()));
