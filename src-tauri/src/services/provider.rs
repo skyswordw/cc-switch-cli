@@ -212,6 +212,9 @@ mod tests {
 
         let live_config_text =
             std::fs::read_to_string(get_codex_config_path()).expect("read live config.toml");
+        let live_config_snippet =
+            ProviderService::codex_config_snippet_from_live_config(&live_config_text)
+                .expect("extract provider config snippet");
 
         let guard = state.config.read().expect("read config after switch");
         let manager = guard
@@ -229,8 +232,87 @@ mod tests {
                 .get("config")
                 .and_then(Value::as_str)
                 .unwrap_or_default(),
-            live_config_text,
-            "provider snapshot should match live config.toml even without auth.json"
+            live_config_snippet,
+            "provider snapshot should match extracted snippet even without auth.json"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn codex_switch_preserves_base_url_and_wire_api_across_multiple_switches() {
+        let temp_home = TempDir::new().expect("create temp home");
+        let _env = EnvGuard::set_home(temp_home.path());
+
+        let mut config = MultiAppConfig::default();
+        config.ensure_app(&AppType::Codex);
+        {
+            let manager = config
+                .get_manager_mut(&AppType::Codex)
+                .expect("codex manager");
+            manager.current = "p1".to_string();
+            manager.providers.insert(
+                "p1".to_string(),
+                Provider::with_id(
+                    "p1".to_string(),
+                    "Provider One".to_string(),
+                    json!({
+                        "auth": { "OPENAI_API_KEY": "sk-one" },
+                        "config": "base_url = \"https://api.one.example/v1\"\nmodel = \"gpt-4o\"\nwire_api = \"responses\"\nenv_key = \"OPENAI_API_KEY\"\nrequires_openai_auth = false\n",
+                    }),
+                    None,
+                ),
+            );
+            manager.providers.insert(
+                "p2".to_string(),
+                Provider::with_id(
+                    "p2".to_string(),
+                    "Provider Two".to_string(),
+                    json!({
+                        "auth": { "OPENAI_API_KEY": "sk-two" },
+                        "config": "base_url = \"https://api.two.example/v1\"\nmodel = \"gpt-4o\"\nwire_api = \"chat\"\nenv_key = \"OPENAI_API_KEY\"\nrequires_openai_auth = false\n",
+                    }),
+                    None,
+                ),
+            );
+        }
+
+        let state = AppState {
+            config: RwLock::new(config),
+        };
+
+        // Seed initial live config for p1, then switch to p2, then back to p1.
+        ProviderService::switch(&state, AppType::Codex, "p1").expect("seed p1 live");
+        ProviderService::switch(&state, AppType::Codex, "p2").expect("switch to p2");
+        ProviderService::switch(&state, AppType::Codex, "p1").expect("switch back to p1");
+
+        let live_text =
+            std::fs::read_to_string(get_codex_config_path()).expect("read live config.toml");
+        let live_snippet =
+            ProviderService::codex_config_snippet_from_live_config(&live_text).expect("snippet");
+        assert!(
+            live_snippet.contains("base_url = \"https://api.one.example/v1\""),
+            "live snippet should retain provider base_url after multiple switches"
+        );
+        assert!(
+            live_snippet.contains("wire_api = \"responses\""),
+            "live snippet should retain provider wire_api after multiple switches"
+        );
+
+        let guard = state.config.read().expect("read config");
+        let manager = guard.get_manager(&AppType::Codex).expect("codex manager");
+        let provider = manager.providers.get("p1").expect("p1 exists");
+        let cfg = provider
+            .settings_config
+            .get("config")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            cfg.contains("base_url = \"https://api.one.example/v1\""),
+            "provider snapshot should retain base_url across switches"
+        );
+        assert!(
+            cfg.contains("wire_api = \"responses\""),
+            "provider snapshot should retain wire_api across switches"
         );
     }
 
@@ -940,6 +1022,7 @@ impl ProviderService {
                     None
                 };
                 let cfg_text = crate::codex_config::read_and_validate_codex_config_text()?;
+                let cfg_snippet = Self::codex_config_snippet_from_live_config(&cfg_text)?;
 
                 {
                     let mut guard = state.config.write().map_err(AppError::from)?;
@@ -953,7 +1036,7 @@ impl ProviderService {
                             if let Some(auth) = auth {
                                 obj.insert("auth".to_string(), auth);
                             }
-                            obj.insert("config".to_string(), Value::String(cfg_text.clone()));
+                            obj.insert("config".to_string(), Value::String(cfg_snippet.clone()));
                         }
                     }
                 }
@@ -1681,6 +1764,97 @@ impl ProviderService {
         })
     }
 
+    /// 从 Codex 的 `config.toml` 中提取当前 provider 的“供应商片段配置”（用于写入到 CC-Switch 的 provider.settings_config.config）。
+    ///
+    /// CC-Switch 约定：Codex provider 的 `settings_config.config` 只存与该 provider 相关的字段（如 base_url / model / wire_api / env_key 等），
+    /// **不**保存整份 `~/.codex/config.toml`，否则二次切换会因字段位置不同而丢失 base_url / wire_api。
+    fn codex_config_snippet_from_live_config(config_text: &str) -> Result<String, AppError> {
+        if config_text.trim().is_empty() {
+            return Ok(String::new());
+        }
+
+        let root: toml::Table = toml::from_str(config_text).map_err(|e| {
+            AppError::Config(format!(
+                "解析 {} 失败: {e}",
+                get_codex_config_path().display()
+            ))
+        })?;
+
+        let model_provider = root
+            .get("model_provider")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let model = root
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("gpt-5.2-codex");
+
+        let provider_table = root
+            .get("model_providers")
+            .and_then(|v| v.as_table())
+            .and_then(|table| {
+                model_provider
+                    .as_deref()
+                    .and_then(|provider_id| table.get(provider_id))
+            })
+            .and_then(|v| v.as_table());
+
+        // 优先从 model_providers.<id> 读取；否则尝试读取旧版的根级字段（向后兼容）
+        let base_url = provider_table
+            .and_then(|t| t.get("base_url"))
+            .and_then(|v| v.as_str())
+            .or_else(|| root.get("base_url").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        let wire_api = provider_table
+            .and_then(|t| t.get("wire_api"))
+            .and_then(|v| v.as_str())
+            .or_else(|| root.get("wire_api").and_then(|v| v.as_str()))
+            .unwrap_or("chat");
+
+        let requires_openai_auth = provider_table
+            .and_then(|t| t.get("requires_openai_auth"))
+            .and_then(|v| v.as_bool())
+            .or_else(|| root.get("requires_openai_auth").and_then(|v| v.as_bool()));
+        let env_key = provider_table
+            .and_then(|t| t.get("env_key"))
+            .and_then(|v| v.as_str())
+            .or_else(|| root.get("env_key").and_then(|v| v.as_str()));
+
+        let mut lines = Vec::new();
+        if !base_url.trim().is_empty() {
+            lines.push(format!("base_url = \"{}\"", base_url.trim()));
+        }
+        lines.push(format!("model = \"{}\"", model.trim()));
+        lines.push(format!("wire_api = \"{}\"", wire_api.trim()));
+
+        match requires_openai_auth {
+            Some(true) => {
+                lines.push("requires_openai_auth = true".to_string());
+            }
+            Some(false) => {
+                if let Some(env_key) = env_key {
+                    let env_key = env_key.trim();
+                    if !env_key.is_empty() {
+                        lines.push(format!("env_key = \"{}\"", env_key));
+                    }
+                }
+                lines.push("requires_openai_auth = false".to_string());
+            }
+            None => {
+                if let Some(env_key) = env_key {
+                    let env_key = env_key.trim();
+                    if !env_key.is_empty() {
+                        lines.push(format!("env_key = \"{}\"", env_key));
+                        // 防止 write_codex_live 推断错误的 OpenAI auth 模式
+                        lines.push("requires_openai_auth = false".to_string());
+                    }
+                }
+            }
+        }
+
+        Ok(lines.join("\n"))
+    }
+
     fn prepare_switch_codex(
         config: &mut MultiAppConfig,
         provider_id: &str,
@@ -1722,26 +1896,37 @@ impl ProviderService {
         }
 
         let auth_path = get_codex_auth_path();
-        if !auth_path.exists() {
+        let config_path = get_codex_config_path();
+        if !auth_path.exists() && !config_path.exists() {
             return Ok(());
         }
 
-        let auth: Value = read_json_file(&auth_path)?;
-        let config_path = get_codex_config_path();
-        let config_text = if config_path.exists() {
-            std::fs::read_to_string(&config_path).map_err(|e| AppError::io(&config_path, e))?
+        let auth = if auth_path.exists() {
+            Some(read_json_file::<Value>(&auth_path)?)
         } else {
-            String::new()
+            None
         };
-
-        let live = json!({
-            "auth": auth,
-            "config": config_text,
-        });
+        let config_snippet = if config_path.exists() {
+            let config_text =
+                std::fs::read_to_string(&config_path).map_err(|e| AppError::io(&config_path, e))?;
+            Some(Self::codex_config_snippet_from_live_config(&config_text)?)
+        } else {
+            None
+        };
 
         if let Some(manager) = config.get_manager_mut(&AppType::Codex) {
             if let Some(current) = manager.providers.get_mut(&current_id) {
-                current.settings_config = live;
+                if !current.settings_config.is_object() {
+                    current.settings_config = json!({});
+                }
+
+                let obj = current.settings_config.as_object_mut().unwrap();
+                if let Some(auth) = auth {
+                    obj.insert("auth".to_string(), auth);
+                }
+                if let Some(config_snippet) = config_snippet {
+                    obj.insert("config".to_string(), Value::String(config_snippet));
+                }
             }
         }
 
