@@ -27,6 +27,10 @@ Run commands from the repo root unless noted.
 - Use Rust conventions: `snake_case` for modules/functions, `CamelCase` for types, `SCREAMING_SNAKE_CASE` for constants.
 - Keep CLI output stable and user-facing strings i18n-aware (see `src-tauri/src/cli/i18n.rs`).
 
+## CLI/TUI Parity
+
+- If you add a new user-facing feature/command, also add a corresponding entry in the interactive TUI flows (`src-tauri/src/cli/interactive/`) and i18n strings (`src-tauri/src/cli/i18n.rs`) so it’s discoverable from the TUI.
+
 ## Testing Guidelines
 
 - Tests live in `src-tauri/tests/*.rs` and should avoid touching real user data; follow the existing pattern that isolates `HOME`.

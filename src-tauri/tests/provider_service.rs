@@ -1,9 +1,10 @@
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::RwLock;
 
 use cc_switch_lib::{
     get_claude_settings_path, read_json_file, write_codex_live_atomic, AppError, AppState, AppType,
-    MultiAppConfig, Provider, ProviderMeta, ProviderService,
+    McpApps, McpServer, MultiAppConfig, Provider, ProviderMeta, ProviderService,
 };
 
 #[path = "support.rs"]
@@ -69,16 +70,27 @@ command = "say"
         );
     }
 
-    initial_config.mcp.codex.servers.insert(
+    // v3.7.0: unified MCP structure
+    initial_config.mcp.servers = Some(HashMap::new());
+    initial_config.mcp.servers.as_mut().unwrap().insert(
         "echo-server".into(),
-        json!({
-            "id": "echo-server",
-            "enabled": true,
-            "server": {
+        McpServer {
+            id: "echo-server".to_string(),
+            name: "Echo Server".to_string(),
+            server: json!({
                 "type": "stdio",
                 "command": "echo"
-            }
-        }),
+            }),
+            apps: McpApps {
+                claude: false,
+                codex: true,
+                gemini: false,
+            },
+            description: None,
+            homepage: None,
+            docs: None,
+            tags: Vec::new(),
+        },
     );
 
     let state = AppState {
@@ -118,9 +130,13 @@ command = "say"
         .get("config")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    assert_eq!(
-        new_config_text, config_text,
-        "provider config snapshot should match live file"
+    assert!(
+        new_config_text.contains("model = "),
+        "provider config snapshot should contain model snippet"
+    );
+    assert!(
+        !new_config_text.contains("mcp_servers.echo-server"),
+        "provider config snapshot should not store synced MCP servers"
     );
 
     let legacy = manager
@@ -322,6 +338,92 @@ fn switch_google_official_gemini_sets_oauth_security() {
 }
 
 #[test]
+fn switch_gemini_merges_existing_settings_preserving_mcp_servers() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let home = ensure_test_home();
+
+    let gemini_dir = home.join(".gemini");
+    std::fs::create_dir_all(&gemini_dir).expect("create gemini dir");
+    let gemini_settings_path = gemini_dir.join("settings.json");
+    let existing_settings = json!({
+        "mcpServers": {
+            "keep": { "command": "echo" }
+        }
+    });
+    std::fs::write(
+        &gemini_settings_path,
+        serde_json::to_string_pretty(&existing_settings).expect("serialize existing settings"),
+    )
+    .expect("seed existing gemini settings.json");
+
+    let mut config = MultiAppConfig::default();
+    {
+        let manager = config
+            .get_manager_mut(&AppType::Gemini)
+            .expect("gemini manager");
+        manager.current = "old".to_string();
+        manager.providers.insert(
+            "old".to_string(),
+            Provider::with_id(
+                "old".to_string(),
+                "Old Gemini".to_string(),
+                json!({
+                    "env": {
+                        "GEMINI_API_KEY": "old-key"
+                    }
+                }),
+                None,
+            ),
+        );
+        manager.providers.insert(
+            "new".to_string(),
+            Provider::with_id(
+                "new".to_string(),
+                "New Gemini".to_string(),
+                json!({
+                    "env": {
+                        "GEMINI_API_KEY": "new-key"
+                    },
+                    "config": {
+                        "ccSwitchTestKey": "new",
+                        "security": {
+                            "auth": {
+                                "selectedType": "gemini-api-key"
+                            }
+                        }
+                    }
+                }),
+                None,
+            ),
+        );
+    }
+
+    let state = AppState {
+        config: RwLock::new(config),
+    };
+
+    ProviderService::switch(&state, AppType::Gemini, "new")
+        .expect("switching to new gemini provider should succeed");
+
+    let raw = std::fs::read_to_string(&gemini_settings_path).expect("read gemini settings.json");
+    let value: serde_json::Value = serde_json::from_str(&raw).expect("parse gemini settings.json");
+
+    assert_eq!(
+        value
+            .pointer("/mcpServers/keep/command")
+            .and_then(|v| v.as_str()),
+        Some("echo"),
+        "switch should preserve existing mcpServers entries in Gemini settings.json, got: {raw}"
+    );
+    assert_eq!(
+        value.pointer("/ccSwitchTestKey").and_then(|v| v.as_str()),
+        Some("new"),
+        "switch should merge provider config into existing Gemini settings.json, got: {raw}"
+    );
+}
+
+#[test]
 fn provider_service_switch_claude_updates_live_and_state() {
     let _guard = test_mutex().lock().expect("acquire test mutex");
     reset_test_fs();
@@ -428,7 +530,11 @@ fn provider_service_switch_missing_provider_returns_error() {
 }
 
 #[test]
-fn provider_service_switch_codex_missing_auth_returns_error() {
+fn provider_service_switch_codex_missing_auth_is_allowed() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let _home = ensure_test_home();
+
     let mut config = MultiAppConfig::default();
     {
         let manager = config
@@ -440,7 +546,7 @@ fn provider_service_switch_codex_missing_auth_returns_error() {
                 "invalid".to_string(),
                 "Broken Codex".to_string(),
                 json!({
-                    "config": "[mcp_servers.test]\ncommand = \"noop\""
+                    "config": "base_url = \"https://api.example.com/v1\"\nmodel = \"gpt-4o\"\nenv_key = \"OPENAI_API_KEY\"\nwire_api = \"chat\""
                 }),
                 None,
             ),
@@ -451,15 +557,17 @@ fn provider_service_switch_codex_missing_auth_returns_error() {
         config: RwLock::new(config),
     };
 
-    let err = ProviderService::switch(&state, AppType::Codex, "invalid")
-        .expect_err("switching should fail without auth");
-    match err {
-        AppError::Config(msg) => assert!(
-            msg.contains("auth"),
-            "expected auth related message, got {msg}"
-        ),
-        other => panic!("expected config error, got {other:?}"),
-    }
+    ProviderService::switch(&state, AppType::Codex, "invalid")
+        .expect("switching should succeed without auth.json for Codex 0.64+");
+
+    assert!(
+        !cc_switch_lib::get_codex_auth_path().exists(),
+        "auth.json should not be written when provider has no auth"
+    );
+    assert!(
+        cc_switch_lib::get_codex_config_path().exists(),
+        "config.toml should be written"
+    );
 }
 
 #[test]

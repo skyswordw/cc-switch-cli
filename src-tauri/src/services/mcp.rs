@@ -28,22 +28,36 @@ impl McpService {
 
     /// 添加或更新 MCP 服务器
     pub fn upsert_server(state: &AppState, server: McpServer) -> Result<(), AppError> {
-        {
+        let (server_id, apps_to_remove) = {
             let mut cfg = state.config.write()?;
 
-            // 确保 servers 字段存在
-            if cfg.mcp.servers.is_none() {
-                cfg.mcp.servers = Some(HashMap::new());
-            }
+            let servers = cfg.mcp.servers.get_or_insert_with(HashMap::new);
+            let server_id = server.id.clone();
 
-            let servers = cfg.mcp.servers.as_mut().unwrap();
-            let id = server.id.clone();
+            let apps_to_remove = servers
+                .get(&server_id)
+                .map(|existing| {
+                    existing
+                        .apps
+                        .enabled_apps()
+                        .into_iter()
+                        .filter(|app| !server.apps.is_enabled_for(app))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
 
             // 插入或更新
-            servers.insert(id, server.clone());
-        }
+            servers.insert(server_id.clone(), server.clone());
+
+            (server_id, apps_to_remove)
+        };
 
         state.save()?;
+
+        // 如果是更新：对“由启用变为禁用”的应用，清理对应 live 配置
+        for app in apps_to_remove {
+            Self::remove_server_from_app(state, &server_id, &app)?;
+        }
 
         // 同步到各个启用的应用
         Self::sync_server_to_apps(state, &server)?;

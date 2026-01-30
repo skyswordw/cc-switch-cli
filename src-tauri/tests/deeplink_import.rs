@@ -36,10 +36,14 @@ fn deeplink_import_claude_provider_persists_to_config() {
         .providers
         .get(&provider_id)
         .expect("provider created via deeplink");
-    assert_eq!(provider.name, request.name);
+    assert_eq!(
+        provider.name,
+        request.name.clone().expect("request name"),
+        "provider name should match deeplink"
+    );
     assert_eq!(
         provider.website_url.as_deref(),
-        Some(request.homepage.as_str())
+        request.homepage.as_deref()
     );
     let auth_token = provider
         .settings_config
@@ -49,8 +53,8 @@ fn deeplink_import_claude_provider_persists_to_config() {
         .settings_config
         .pointer("/env/ANTHROPIC_BASE_URL")
         .and_then(|v| v.as_str());
-    assert_eq!(auth_token, Some(request.api_key.as_str()));
-    assert_eq!(base_url, Some(request.endpoint.as_str()));
+    assert_eq!(auth_token, request.api_key.as_deref());
+    assert_eq!(base_url, request.endpoint.as_deref());
     drop(guard);
 
     // 验证配置已持久化
@@ -88,10 +92,14 @@ fn deeplink_import_codex_provider_builds_auth_and_config() {
         .providers
         .get(&provider_id)
         .expect("provider created via deeplink");
-    assert_eq!(provider.name, request.name);
+    assert_eq!(
+        provider.name,
+        request.name.clone().expect("request name"),
+        "provider name should match deeplink"
+    );
     assert_eq!(
         provider.website_url.as_deref(),
-        Some(request.homepage.as_str())
+        request.homepage.as_deref()
     );
     let auth_value = provider
         .settings_config
@@ -102,9 +110,12 @@ fn deeplink_import_codex_provider_builds_auth_and_config() {
         .get("config")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    assert_eq!(auth_value, Some(request.api_key.as_str()));
+    assert_eq!(auth_value, request.api_key.as_deref());
     assert!(
-        config_text.contains(request.endpoint.as_str()),
+        request
+            .endpoint
+            .as_deref()
+            .is_some_and(|endpoint| config_text.contains(endpoint)),
         "config.toml content should contain endpoint"
     );
     assert!(

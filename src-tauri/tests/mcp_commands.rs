@@ -3,8 +3,8 @@ use std::{collections::HashMap, fs, sync::RwLock};
 use serde_json::json;
 
 use cc_switch_lib::{
-    get_claude_mcp_path, get_claude_settings_path, import_default_config_test_hook, AppError,
-    AppState, AppType, McpApps, McpServer, McpService, MultiAppConfig,
+    get_claude_mcp_path, get_claude_settings_path, AppError, AppState, AppType, McpApps, McpServer,
+    McpService, MultiAppConfig, ProviderService,
 };
 
 #[path = "support.rs"]
@@ -39,7 +39,7 @@ fn import_default_config_claude_persists_provider() {
         config: RwLock::new(config),
     };
 
-    import_default_config_test_hook(&state, AppType::Claude)
+    ProviderService::import_default_config(&state, AppType::Claude)
         .expect("import default config succeeds");
 
     // 验证内存状态
@@ -73,7 +73,7 @@ fn import_default_config_without_live_file_returns_error() {
         config: RwLock::new(MultiAppConfig::default()),
     };
 
-    let err = import_default_config_test_hook(&state, AppType::Claude)
+    let err = ProviderService::import_default_config(&state, AppType::Claude)
         .expect_err("missing live file should error");
     match err {
         AppError::Localized { zh, .. } => assert!(
@@ -180,6 +180,116 @@ fn import_mcp_from_claude_invalid_json_preserves_state() {
 }
 
 #[test]
+fn import_mcp_from_gemini_imports_http_and_sse_servers() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let home = ensure_test_home();
+
+    let gemini_dir = home.join(".gemini");
+    fs::create_dir_all(&gemini_dir).expect("create gemini dir");
+    let settings_path = gemini_dir.join("settings.json");
+    let settings = json!({
+        "mcpServers": {
+            "remote_http": {
+                "httpUrl": "http://localhost:1234"
+            },
+            "remote_sse": {
+                "url": "http://localhost:5678"
+            },
+            "local_stdio": {
+                "command": "echo"
+            }
+        }
+    });
+    fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&settings).expect("serialize gemini settings"),
+    )
+    .expect("seed ~/.gemini/settings.json");
+
+    let state = AppState {
+        config: RwLock::new(MultiAppConfig::default()),
+    };
+
+    McpService::import_from_gemini(&state).expect("import mcp from gemini succeeds");
+
+    let guard = state.config.read().expect("lock config");
+    // v3.7.0: 检查统一结构
+    let servers = guard
+        .mcp
+        .servers
+        .as_ref()
+        .expect("unified servers should exist");
+
+    let remote_http = servers
+        .get("remote_http")
+        .expect("remote_http server imported into unified structure");
+    assert!(
+        remote_http.apps.gemini,
+        "remote_http should enable Gemini app"
+    );
+    assert_eq!(
+        remote_http.server.get("type").and_then(|v| v.as_str()),
+        Some("http"),
+        "remote_http should be normalized to type http"
+    );
+    assert!(
+        remote_http
+            .server
+            .get("url")
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| v == "http://localhost:1234"),
+        "remote_http should have url field"
+    );
+    assert!(
+        remote_http.server.get("httpUrl").is_none(),
+        "remote_http should not keep httpUrl field"
+    );
+
+    let remote_sse = servers
+        .get("remote_sse")
+        .expect("remote_sse server imported into unified structure");
+    assert!(
+        remote_sse.apps.gemini,
+        "remote_sse should enable Gemini app"
+    );
+    assert_eq!(
+        remote_sse.server.get("type").and_then(|v| v.as_str()),
+        Some("sse"),
+        "remote_sse should be normalized to type sse"
+    );
+    assert!(
+        remote_sse
+            .server
+            .get("url")
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| v == "http://localhost:5678"),
+        "remote_sse should have url field"
+    );
+
+    let local_stdio = servers
+        .get("local_stdio")
+        .expect("local_stdio server imported into unified structure");
+    assert!(
+        local_stdio.apps.gemini,
+        "local_stdio should enable Gemini app"
+    );
+    assert_eq!(
+        local_stdio.server.get("type").and_then(|v| v.as_str()),
+        Some("stdio"),
+        "local_stdio should be normalized to type stdio"
+    );
+    assert!(
+        local_stdio
+            .server
+            .get("command")
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| v == "echo"),
+        "local_stdio should have command field"
+    );
+}
+
+#[test]
 fn set_mcp_enabled_for_codex_writes_live_config() {
     let _guard = test_mutex().lock().expect("acquire test mutex");
     reset_test_fs();
@@ -252,5 +362,104 @@ fn set_mcp_enabled_for_codex_writes_live_config() {
     assert!(
         toml_text.contains("codex-server"),
         "codex config should include the enabled server definition"
+    );
+}
+
+#[test]
+fn upsert_server_disables_app_removes_from_gemini_live() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let home = ensure_test_home();
+    let url = "http://localhost:1234";
+
+    // 预先写入 Gemini live 配置，包含待删除的 MCP server
+    let gemini_dir = home.join(".gemini");
+    fs::create_dir_all(&gemini_dir).expect("create gemini dir");
+    let settings_path = gemini_dir.join("settings.json");
+    let settings = json!({
+        "mcpServers": {
+            "remove_me": {
+                "httpUrl": url
+            }
+        }
+    });
+    fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&settings).expect("serialize gemini settings"),
+    )
+    .expect("seed ~/.gemini/settings.json");
+
+    let seeded_text = fs::read_to_string(&settings_path).expect("read gemini settings after seed");
+    let seeded_json: serde_json::Value =
+        serde_json::from_str(&seeded_text).expect("parse gemini settings after seed");
+    let seeded_present = seeded_json
+        .get("mcpServers")
+        .and_then(|v| v.as_object())
+        .is_some_and(|mcp_servers| mcp_servers.contains_key("remove_me"));
+    assert!(
+        seeded_present,
+        "seeded ~/.gemini/settings.json should include remove_me"
+    );
+
+    // 初始化统一结构：旧值 Gemini = true
+    let mut config = MultiAppConfig::default();
+    config.mcp.servers = Some(HashMap::new());
+    config.mcp.servers.as_mut().unwrap().insert(
+        "remove_me".into(),
+        McpServer {
+            id: "remove_me".to_string(),
+            name: "Remove Me".to_string(),
+            server: json!({
+                "type": "http",
+                "url": url
+            }),
+            apps: McpApps {
+                claude: false,
+                codex: false,
+                gemini: true,
+            },
+            description: None,
+            homepage: None,
+            docs: None,
+            tags: Vec::new(),
+        },
+    );
+
+    let state = AppState {
+        config: RwLock::new(config),
+    };
+
+    // 模拟“取消勾选 Gemini”
+    let server = McpServer {
+        id: "remove_me".to_string(),
+        name: "Remove Me".to_string(),
+        server: json!({
+            "type": "http",
+            "url": url
+        }),
+        apps: McpApps {
+            claude: false,
+            codex: false,
+            gemini: false,
+        },
+        description: None,
+        homepage: None,
+        docs: None,
+        tags: Vec::new(),
+    };
+
+    McpService::upsert_server(&state, server).expect("upsert server succeeds");
+
+    // 断言：Gemini live 中应移除该 server
+    let settings_text = fs::read_to_string(&settings_path).expect("read gemini settings");
+    let settings_json: serde_json::Value =
+        serde_json::from_str(&settings_text).expect("parse gemini settings");
+    let remove_me_present = settings_json
+        .get("mcpServers")
+        .and_then(|v| v.as_object())
+        .is_some_and(|mcp_servers| mcp_servers.contains_key("remove_me"));
+    assert!(
+        !remove_me_present,
+        "upsert with Gemini disabled should remove it from ~/.gemini/settings.json, got: {settings_text}"
     );
 }

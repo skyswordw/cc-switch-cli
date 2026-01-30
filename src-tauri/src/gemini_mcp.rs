@@ -56,11 +56,35 @@ pub fn read_mcp_servers_map() -> Result<std::collections::HashMap<String, Value>
     }
 
     let root = read_json_value(&path)?;
-    let servers = root
-        .get("mcpServers")
-        .and_then(|v| v.as_object())
-        .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-        .unwrap_or_default();
+    let mut servers: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    let Some(obj) = root.get("mcpServers").and_then(|v| v.as_object()) else {
+        return Ok(servers);
+    };
+
+    for (id, raw_spec) in obj {
+        let mut spec = raw_spec.clone();
+
+        // Reverse conversion (align upstream):
+        // - httpUrl -> url + type:"http"
+        // - if no type: command => "stdio", url => "sse"
+        if let Some(spec_obj) = spec.as_object_mut() {
+            if let Some(http_url_value) = spec_obj.remove("httpUrl") {
+                spec_obj.insert("url".to_string(), http_url_value);
+                spec_obj.insert("type".to_string(), Value::String("http".to_string()));
+            }
+
+            let has_type = spec_obj.get("type").and_then(|v| v.as_str()).is_some();
+            if !has_type {
+                if spec_obj.get("command").and_then(|v| v.as_str()).is_some() {
+                    spec_obj.insert("type".to_string(), Value::String("stdio".to_string()));
+                } else if spec_obj.get("url").and_then(|v| v.as_str()).is_some() {
+                    spec_obj.insert("type".to_string(), Value::String("sse".to_string()));
+                }
+            }
+        }
+
+        servers.insert(id.clone(), spec);
+    }
 
     Ok(servers)
 }
@@ -107,6 +131,43 @@ pub fn set_mcp_servers_map(
             }
         }
         // SSE 保持 "url" 字段不变
+
+        // Timeout conversion:
+        // - CC-Switch/Codex/Claude may use startup_timeout_* / tool_timeout_*.
+        // - Gemini CLI uses a single timeout field (ms).
+        // Derive Gemini timeout by taking the maximum of:
+        //   - existing `timeout` (if any)
+        //   - startup timeout (default 10s)
+        //   - tool timeout (default 60s)
+        const DEFAULT_STARTUP_MS: u64 = 10_000;
+        const DEFAULT_TOOL_MS: u64 = 60_000;
+
+        let existing_timeout_ms = obj
+            .get("timeout")
+            .and_then(|val| val.as_u64().or_else(|| val.as_f64().map(|f| f as u64)));
+
+        let extract_timeout =
+            |obj: &mut Map<String, Value>, key: &str, multiplier: u64| -> Option<u64> {
+                obj.remove(key).and_then(|val| {
+                    val.as_u64()
+                        .map(|n| n.saturating_mul(multiplier))
+                        .or_else(|| val.as_f64().map(|f| (f * multiplier as f64) as u64))
+                })
+            };
+
+        let startup_ms = extract_timeout(&mut obj, "startup_timeout_sec", 1000)
+            .or_else(|| extract_timeout(&mut obj, "startup_timeout_ms", 1))
+            .unwrap_or(DEFAULT_STARTUP_MS);
+        let tool_ms = extract_timeout(&mut obj, "tool_timeout_sec", 1000)
+            .or_else(|| extract_timeout(&mut obj, "tool_timeout_ms", 1))
+            .unwrap_or(DEFAULT_TOOL_MS);
+
+        let derived_timeout_ms = startup_ms.max(tool_ms);
+        let final_timeout_ms = existing_timeout_ms.unwrap_or(0).max(derived_timeout_ms);
+        obj.insert(
+            "timeout".to_string(),
+            Value::Number(final_timeout_ms.into()),
+        );
 
         // 移除 UI 辅助字段和 type 字段（Gemini 不需要）
         obj.remove("type");

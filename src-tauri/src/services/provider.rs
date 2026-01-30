@@ -2274,15 +2274,37 @@ impl ProviderService {
         let mut env_map = json_to_env(&content_to_write)?;
 
         // 准备要写入 ~/.gemini/settings.json 的配置（缺省时保留现有文件内容）
+        let settings_path = get_gemini_settings_path();
         let mut config_to_write = if let Some(config_value) = content_to_write.get("config") {
             if config_value.is_null() {
                 None // null → 保留现有文件
-            } else if config_value.is_object() {
-                let obj = config_value.as_object().unwrap();
-                if obj.is_empty() {
+            } else if let Some(provider_config) = config_value.as_object() {
+                if provider_config.is_empty() {
                     None // 空对象 {} → 保留现有文件
                 } else {
-                    Some(config_value.clone()) // 有内容 → 才替换
+                    // 有内容 → 合并到现有 settings.json（保留现有 key，如 mcpServers），供应商优先
+                    let mut merged = if settings_path.exists() {
+                        read_json_file(&settings_path)?
+                    } else {
+                        json!({})
+                    };
+
+                    if !merged.is_object() {
+                        merged = json!({});
+                    }
+
+                    let merged_map = merged.as_object_mut().ok_or_else(|| {
+                        AppError::localized(
+                            "gemini.validation.invalid_settings",
+                            "Gemini 现有 settings.json 格式错误: 必须是对象",
+                            "Gemini existing settings.json invalid: must be a JSON object",
+                        )
+                    })?;
+                    for (key, value) in provider_config {
+                        merged_map.insert(key.clone(), value.clone());
+                    }
+
+                    Some(merged)
                 }
             } else {
                 return Err(AppError::localized(
@@ -2296,7 +2318,6 @@ impl ProviderService {
         };
 
         if config_to_write.is_none() {
-            let settings_path = get_gemini_settings_path();
             if settings_path.exists() {
                 config_to_write = Some(read_json_file(&settings_path)?);
             } else {
@@ -2319,7 +2340,6 @@ impl ProviderService {
         }
 
         if let Some(config_value) = config_to_write {
-            let settings_path = get_gemini_settings_path();
             write_json_file(&settings_path, &config_value)?;
         }
 

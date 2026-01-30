@@ -714,14 +714,10 @@ pub fn sync_enabled_to_gemini(config: &MultiAppConfig) -> Result<(), AppError> {
 pub fn import_from_gemini(config: &mut MultiAppConfig) -> Result<usize, AppError> {
     use crate::app_config::{McpApps, McpServer};
 
-    let text_opt = crate::gemini_mcp::read_mcp_json()?;
-    let Some(text) = text_opt else { return Ok(0) };
-
-    let v: Value = serde_json::from_str(&text)
-        .map_err(|e| AppError::McpValidation(format!("解析 ~/.gemini/settings.json 失败: {e}")))?;
-    let Some(map) = v.get("mcpServers").and_then(|x| x.as_object()) else {
+    let map = crate::gemini_mcp::read_mcp_servers_map()?;
+    if map.is_empty() {
         return Ok(0);
-    };
+    }
 
     // 确保新结构存在
     if config.mcp.servers.is_none() {

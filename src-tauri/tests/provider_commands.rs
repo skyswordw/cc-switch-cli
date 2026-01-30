@@ -1,9 +1,10 @@
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::RwLock;
 
 use cc_switch_lib::{
-    get_codex_auth_path, get_codex_config_path, read_json_file, switch_provider_test_hook,
-    write_codex_live_atomic, AppError, AppState, AppType, MultiAppConfig, Provider,
+    get_codex_auth_path, get_codex_config_path, read_json_file, write_codex_live_atomic, AppState,
+    AppType, McpApps, McpServer, MultiAppConfig, Provider, ProviderService,
 };
 
 #[path = "support.rs"]
@@ -59,23 +60,34 @@ command = "say"
         );
     }
 
-    config.mcp.codex.servers.insert(
+    // v3.7.0: unified MCP structure
+    config.mcp.servers = Some(HashMap::new());
+    config.mcp.servers.as_mut().unwrap().insert(
         "echo-server".into(),
-        json!({
-            "id": "echo-server",
-            "enabled": true,
-            "server": {
+        McpServer {
+            id: "echo-server".to_string(),
+            name: "Echo Server".to_string(),
+            server: json!({
                 "type": "stdio",
                 "command": "echo"
-            }
-        }),
+            }),
+            apps: McpApps {
+                claude: false,
+                codex: true,
+                gemini: false,
+            },
+            description: None,
+            homepage: None,
+            docs: None,
+            tags: Vec::new(),
+        },
     );
 
     let app_state = AppState {
         config: RwLock::new(config),
     };
 
-    switch_provider_test_hook(&app_state, AppType::Codex, "new-provider")
+    ProviderService::switch(&app_state, AppType::Codex, "new-provider")
         .expect("switch provider should succeed");
 
     let auth_value: serde_json::Value =
@@ -110,9 +122,13 @@ command = "say"
         .get("config")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    assert_eq!(
-        new_config_text, config_text,
-        "provider config snapshot should match live file"
+    assert!(
+        new_config_text.contains("model = "),
+        "provider config snapshot should contain model snippet"
+    );
+    assert!(
+        !new_config_text.contains("mcp_servers.echo-server"),
+        "provider config snapshot should not store synced MCP servers"
     );
 
     let legacy = manager
@@ -146,7 +162,7 @@ fn switch_provider_missing_provider_returns_error() {
         config: RwLock::new(config),
     };
 
-    let err = switch_provider_test_hook(&app_state, AppType::Claude, "missing-provider")
+    let err = ProviderService::switch(&app_state, AppType::Claude, "missing-provider")
         .expect_err("switching to a missing provider should fail");
 
     assert!(
@@ -214,7 +230,7 @@ fn switch_provider_updates_claude_live_and_state() {
         config: RwLock::new(config),
     };
 
-    switch_provider_test_hook(&app_state, AppType::Claude, "new-provider")
+    ProviderService::switch(&app_state, AppType::Claude, "new-provider")
         .expect("switch provider should succeed");
 
     let live_after: serde_json::Value =
@@ -281,7 +297,7 @@ fn switch_provider_updates_claude_live_and_state() {
 }
 
 #[test]
-fn switch_provider_codex_missing_auth_returns_error_and_keeps_state() {
+fn switch_provider_codex_allows_missing_auth_and_writes_config() {
     let _guard = test_mutex().lock().expect("acquire test mutex");
     reset_test_fs();
     let _home = ensure_test_home();
@@ -308,20 +324,21 @@ fn switch_provider_codex_missing_auth_returns_error_and_keeps_state() {
         config: RwLock::new(config),
     };
 
-    let err = switch_provider_test_hook(&app_state, AppType::Codex, "invalid")
-        .expect_err("switching should fail when auth missing");
-    match err {
-        AppError::Config(msg) => assert!(
-            msg.contains("auth"),
-            "expected auth missing error message, got {msg}"
-        ),
-        other => panic!("expected config error, got {other:?}"),
-    }
+    ProviderService::switch(&app_state, AppType::Codex, "invalid")
+        .expect("switching should succeed without auth.json for Codex 0.64+");
 
     let locked = app_state.config.read().expect("lock config after failure");
     let manager = locked.get_manager(&AppType::Codex).expect("codex manager");
     assert!(
-        manager.current.is_empty(),
-        "current provider should remain empty on failure"
+        manager.current == "invalid",
+        "current provider should update after successful switch"
     );
+
+    let auth_path = get_codex_auth_path();
+    assert!(
+        !auth_path.exists(),
+        "auth.json should not be written when provider has no auth"
+    );
+    let cfg_path = get_codex_config_path();
+    assert!(cfg_path.exists(), "config.toml should be written");
 }

@@ -1,6 +1,6 @@
 use serde_json::json;
 use std::{fs, path::Path, sync::RwLock};
-use tauri::async_runtime;
+use futures::executor::block_on;
 
 use cc_switch_lib::{
     get_claude_settings_path, read_json_file, AppError, AppState, AppType, ConfigService,
@@ -721,7 +721,7 @@ fn create_backup_skips_missing_file() {
     let config_path = home.join(".cc-switch").join("config.json");
 
     // 未创建文件时应返回空字符串，不报错
-    let result = ConfigService::create_backup(&config_path).expect("create backup");
+    let result = ConfigService::create_backup(&config_path, None).expect("create backup");
     assert!(
         result.is_empty(),
         "expected empty backup id when config file missing"
@@ -738,7 +738,7 @@ fn create_backup_generates_snapshot_file() {
     fs::create_dir_all(&config_dir).expect("prepare config dir");
     fs::write(&config_path, r#"{"version":2}"#).expect("write config file");
 
-    let backup_id = ConfigService::create_backup(&config_path).expect("backup success");
+    let backup_id = ConfigService::create_backup(&config_path, None).expect("backup success");
     assert!(
         !backup_id.is_empty(),
         "backup id should contain timestamp information"
@@ -778,7 +778,7 @@ fn create_backup_retains_only_latest_entries() {
     std::thread::sleep(std::time::Duration::from_secs(1));
 
     let latest_backup_id =
-        ConfigService::create_backup(&config_path).expect("create backup with cleanup");
+        ConfigService::create_backup(&config_path, None).expect("create backup with cleanup");
     assert!(
         !latest_backup_id.is_empty(),
         "backup id should not be empty when config exists"
@@ -1072,7 +1072,7 @@ fn export_config_to_file_writes_target_path() {
         fs::remove_file(&export_path).expect("cleanup export target");
     }
 
-    let result = async_runtime::block_on(cc_switch_lib::export_config_to_file(
+    let result = block_on(cc_switch_lib::export_config_to_file(
         export_path.to_string_lossy().to_string(),
     ))
     .expect("export should succeed");
@@ -1096,7 +1096,7 @@ fn export_config_to_file_returns_error_when_source_missing() {
         fs::remove_file(&export_path).expect("cleanup export target");
     }
 
-    let err = async_runtime::block_on(cc_switch_lib::export_config_to_file(
+    let err = block_on(cc_switch_lib::export_config_to_file(
         export_path.to_string_lossy().to_string(),
     ))
     .expect_err("export should fail when config.json missing");
