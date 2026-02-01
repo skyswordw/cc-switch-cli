@@ -42,12 +42,17 @@ impl std::fmt::Display for Language {
 fn language_store() -> &'static RwLock<Language> {
     static STORE: OnceLock<RwLock<Language>> = OnceLock::new();
     STORE.get_or_init(|| {
-        let settings = get_settings();
-        let lang = settings
-            .language
-            .as_deref()
-            .map(Language::from_code)
-            .unwrap_or(Language::English);
+        let lang = if cfg!(test) {
+            // Keep unit tests deterministic and avoid reading real user settings.
+            Language::English
+        } else {
+            let settings = get_settings();
+            settings
+                .language
+                .as_deref()
+                .map(Language::from_code)
+                .unwrap_or(Language::English)
+        };
         RwLock::new(lang)
     })
 }
@@ -538,9 +543,9 @@ pub mod texts {
 
     pub fn tui_help_text() -> &'static str {
         if is_chinese() {
-            "[ ]  切换应用\n←→  切换菜单/内容焦点\n↑↓  移动\n/   过滤\nEsc  返回\n?   显示/关闭帮助\n\n页面快捷键（在页面内容区顶部显示）：\n- Providers: Enter 详情，s 切换，a 添加，e 编辑，d 删除，t 测速\n- Provider Detail: s 切换，e 编辑，t 测速\n- MCP: x 启用/禁用(当前应用)，m 选择应用，a 添加，e 编辑，i 导入，v 校验命令，d 删除\n- Prompts: Enter 查看，a 激活，x 取消激活(当前)，e 编辑，d 删除\n- Config: Enter 打开/执行，e 编辑片段\n- Settings: Enter 应用"
+            "[ ]  切换应用\n←→  切换菜单/内容焦点\n↑↓  移动\n/   过滤\nEsc  返回\n?   显示/关闭帮助\n\n页面快捷键（在页面内容区顶部显示）：\n- Providers: Enter 详情，s 切换，a 添加，e 编辑，d 删除，t 测速\n- Provider Detail: s 切换，e 编辑，t 测速\n- MCP: x 启用/禁用(当前应用)，m 选择应用，a 添加，e 编辑，i 导入，v 校验命令，d 删除\n- Prompts: Enter 查看，a 激活，x 取消激活(当前)，e 编辑，d 删除\n- Skills: Enter 详情，x 启用/禁用(当前应用)，a 安装，d 卸载，f 发现，u 未管理，r 仓库，s 同步，m 同步方式\n- Config: Enter 打开/执行，e 编辑片段\n- Settings: Enter 应用"
         } else {
-            "[ ]  switch app\n←→  focus menu/content\n↑↓  move\n/   filter\nEsc  back\n?   toggle help\n\nPage keys (shown at the top of each page):\n- Providers: Enter details, s switch, a add, e edit, d delete, t speedtest\n- Provider Detail: s switch, e edit, t speedtest\n- MCP: x toggle current, m select apps, a add, e edit, i import, v validate, d delete\n- Prompts: Enter view, a activate, x deactivate active, e edit, d delete\n- Config: Enter open/run, e edit snippet\n- Settings: Enter apply"
+            "[ ]  switch app\n←→  focus menu/content\n↑↓  move\n/   filter\nEsc  back\n?   toggle help\n\nPage keys (shown at the top of each page):\n- Providers: Enter details, s switch, a add, e edit, d delete, t speedtest\n- Provider Detail: s switch, e edit, t speedtest\n- MCP: x toggle current, m select apps, a add, e edit, i import, v validate, d delete\n- Prompts: Enter view, a activate, x deactivate active, e edit, d delete\n- Skills: Enter details, x toggle current, a install, d uninstall, f discover, u unmanaged, r repos, s sync, m sync method\n- Config: Enter open/run, e edit snippet\n- Settings: Enter apply"
         }
     }
 
@@ -696,6 +701,14 @@ pub mod texts {
         "N/A"
     }
 
+    pub fn tui_loading() -> &'static str {
+        if is_chinese() {
+            "处理中…"
+        } else {
+            "Working…"
+        }
+    }
+
     pub fn tui_header_id() -> &'static str {
         "ID"
     }
@@ -704,12 +717,112 @@ pub mod texts {
         "API URL"
     }
 
+    pub fn tui_header_directory() -> &'static str {
+        if is_chinese() {
+            "目录"
+        } else {
+            "Directory"
+        }
+    }
+
+    pub fn tui_header_repo() -> &'static str {
+        if is_chinese() {
+            "仓库"
+        } else {
+            "Repo"
+        }
+    }
+
+    pub fn tui_header_branch() -> &'static str {
+        if is_chinese() {
+            "分支"
+        } else {
+            "Branch"
+        }
+    }
+
+    pub fn tui_header_path() -> &'static str {
+        if is_chinese() {
+            "路径"
+        } else {
+            "Path"
+        }
+    }
+
+    pub fn tui_header_found_in() -> &'static str {
+        if is_chinese() {
+            "发现于"
+        } else {
+            "Found In"
+        }
+    }
+
+    pub fn tui_header_field() -> &'static str {
+        if is_chinese() {
+            "字段"
+        } else {
+            "Field"
+        }
+    }
+
+    pub fn tui_header_value() -> &'static str {
+        if is_chinese() {
+            "值"
+        } else {
+            "Value"
+        }
+    }
+
+    pub fn tui_header_claude_short() -> &'static str {
+        "C"
+    }
+
+    pub fn tui_header_codex_short() -> &'static str {
+        "X"
+    }
+
+    pub fn tui_header_gemini_short() -> &'static str {
+        "G"
+    }
+
     pub fn tui_label_id() -> &'static str {
         "ID"
     }
 
     pub fn tui_label_api_url() -> &'static str {
         "API URL"
+    }
+
+    pub fn tui_label_directory() -> &'static str {
+        if is_chinese() {
+            "目录"
+        } else {
+            "Directory"
+        }
+    }
+
+    pub fn tui_label_enabled_for() -> &'static str {
+        if is_chinese() {
+            "已启用"
+        } else {
+            "Enabled"
+        }
+    }
+
+    pub fn tui_label_repo() -> &'static str {
+        if is_chinese() {
+            "仓库"
+        } else {
+            "Repo"
+        }
+    }
+
+    pub fn tui_label_readme() -> &'static str {
+        if is_chinese() {
+            "README"
+        } else {
+            "README"
+        }
     }
 
     pub fn tui_label_base_url() -> &'static str {
@@ -725,6 +838,98 @@ pub mod texts {
             "API Key"
         } else {
             "API Key"
+        }
+    }
+
+    pub fn tui_label_command() -> &'static str {
+        if is_chinese() {
+            "命令"
+        } else {
+            "Command"
+        }
+    }
+
+    pub fn tui_label_args() -> &'static str {
+        if is_chinese() {
+            "参数"
+        } else {
+            "Args"
+        }
+    }
+
+    pub fn tui_label_app_claude() -> &'static str {
+        if is_chinese() {
+            "应用: Claude"
+        } else {
+            "App: Claude"
+        }
+    }
+
+    pub fn tui_label_app_codex() -> &'static str {
+        if is_chinese() {
+            "应用: Codex"
+        } else {
+            "App: Codex"
+        }
+    }
+
+    pub fn tui_label_app_gemini() -> &'static str {
+        if is_chinese() {
+            "应用: Gemini"
+        } else {
+            "App: Gemini"
+        }
+    }
+
+    pub fn tui_form_templates_title() -> &'static str {
+        if is_chinese() {
+            "模板"
+        } else {
+            "Templates"
+        }
+    }
+
+    pub fn tui_form_common_config_button() -> &'static str {
+        if is_chinese() {
+            "通用配置"
+        } else {
+            "Common Config"
+        }
+    }
+
+    pub fn tui_form_attach_common_config() -> &'static str {
+        if is_chinese() {
+            "添加通用配置"
+        } else {
+            "Attach Common Config"
+        }
+    }
+
+    pub fn tui_form_fields_title() -> &'static str {
+        if is_chinese() {
+            "字段"
+        } else {
+            "Fields"
+        }
+    }
+
+    pub fn tui_form_json_title() -> &'static str {
+        "JSON"
+    }
+
+    pub fn tui_form_input_title() -> &'static str {
+        if is_chinese() {
+            "输入"
+        } else {
+            "Input"
+        }
+    }
+
+    pub fn tui_form_editing_title() -> &'static str {
+        if is_chinese() {
+            "编辑中"
+        } else {
+            "Editing"
         }
     }
 
@@ -757,6 +962,14 @@ pub mod texts {
             "新增供应商"
         } else {
             "Add Provider"
+        }
+    }
+
+    pub fn tui_provider_edit_title(name: &str) -> String {
+        if is_chinese() {
+            format!("编辑供应商: {name}")
+        } else {
+            format!("Edit Provider: {name}")
         }
     }
 
@@ -829,6 +1042,86 @@ pub mod texts {
             "导入"
         } else {
             "import"
+        }
+    }
+
+    pub fn tui_key_install() -> &'static str {
+        if is_chinese() {
+            "安装"
+        } else {
+            "install"
+        }
+    }
+
+    pub fn tui_key_uninstall() -> &'static str {
+        if is_chinese() {
+            "卸载"
+        } else {
+            "uninstall"
+        }
+    }
+
+    pub fn tui_key_discover() -> &'static str {
+        if is_chinese() {
+            "发现"
+        } else {
+            "discover"
+        }
+    }
+
+    pub fn tui_key_unmanaged() -> &'static str {
+        if is_chinese() {
+            "未管理"
+        } else {
+            "unmanaged"
+        }
+    }
+
+    pub fn tui_key_repos() -> &'static str {
+        if is_chinese() {
+            "仓库"
+        } else {
+            "repos"
+        }
+    }
+
+    pub fn tui_key_sync() -> &'static str {
+        if is_chinese() {
+            "同步"
+        } else {
+            "sync"
+        }
+    }
+
+    pub fn tui_key_sync_method() -> &'static str {
+        if is_chinese() {
+            "同步方式"
+        } else {
+            "sync method"
+        }
+    }
+
+    pub fn tui_key_search() -> &'static str {
+        if is_chinese() {
+            "搜索"
+        } else {
+            "search"
+        }
+    }
+
+    pub fn tui_key_refresh() -> &'static str {
+        if is_chinese() {
+            "刷新"
+        } else {
+            "refresh"
+        }
+    }
+
+    pub fn tui_key_focus() -> &'static str {
+        if is_chinese() {
+            "焦点"
+        } else {
+            "focus"
         }
     }
 
@@ -994,9 +1287,9 @@ pub mod texts {
 
     pub fn tui_key_select() -> &'static str {
         if is_chinese() {
-            "打开/执行"
+            "选择"
         } else {
-            "open/run"
+            "select"
         }
     }
 
@@ -1103,6 +1396,261 @@ pub mod texts {
             "配置"
         } else {
             "Configuration"
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Ratatui TUI - Skills
+    // ---------------------------------------------------------------------
+
+    pub fn tui_skills_install_title() -> &'static str {
+        if is_chinese() {
+            "安装 Skill"
+        } else {
+            "Install Skill"
+        }
+    }
+
+    pub fn tui_skills_install_prompt() -> &'static str {
+        if is_chinese() {
+            "输入技能目录或完整 key（owner/name:directory）："
+        } else {
+            "Enter a skill directory or full key (owner/name:directory):"
+        }
+    }
+
+    pub fn tui_skills_uninstall_title() -> &'static str {
+        if is_chinese() {
+            "卸载 Skill"
+        } else {
+            "Uninstall Skill"
+        }
+    }
+
+    pub fn tui_confirm_uninstall_skill_message(name: &str, directory: &str) -> String {
+        if is_chinese() {
+            format!("确认卸载 '{name}'（{directory}）？")
+        } else {
+            format!("Uninstall '{name}' ({directory})?")
+        }
+    }
+
+    pub fn tui_skills_discover_title() -> &'static str {
+        if is_chinese() {
+            "发现 Skills"
+        } else {
+            "Discover Skills"
+        }
+    }
+
+    pub fn tui_skills_discover_prompt() -> &'static str {
+        if is_chinese() {
+            "搜索关键字（留空显示全部）："
+        } else {
+            "Search query (empty shows all):"
+        }
+    }
+
+    pub fn tui_skills_discover_query_empty() -> &'static str {
+        if is_chinese() {
+            "全部"
+        } else {
+            "all"
+        }
+    }
+
+    pub fn tui_skills_discover_hint() -> &'static str {
+        if is_chinese() {
+            "按 f 搜索可安装的 Skills。结果来自已启用的 repos。"
+        } else {
+            "Press f to search installable Skills. Results come from enabled repos."
+        }
+    }
+
+    pub fn tui_skills_repos_title() -> &'static str {
+        if is_chinese() {
+            "Skill 仓库"
+        } else {
+            "Skill Repositories"
+        }
+    }
+
+    pub fn tui_skills_repos_hint() -> &'static str {
+        if is_chinese() {
+            "Discover/Install 将从已启用的仓库中拉取技能列表。"
+        } else {
+            "Discover/Install fetch skills from enabled repositories."
+        }
+    }
+
+    pub fn tui_skills_repos_empty() -> &'static str {
+        if is_chinese() {
+            "未配置任何 Skill 仓库。按 a 添加。"
+        } else {
+            "No skill repositories configured. Press a to add."
+        }
+    }
+
+    pub fn tui_skills_repos_add_title() -> &'static str {
+        if is_chinese() {
+            "添加仓库"
+        } else {
+            "Add Repository"
+        }
+    }
+
+    pub fn tui_skills_repos_add_prompt() -> &'static str {
+        if is_chinese() {
+            "输入 owner/name[@branch] 或 GitHub URL："
+        } else {
+            "Enter owner/name[@branch] or a GitHub URL:"
+        }
+    }
+
+    pub fn tui_skills_repos_remove_title() -> &'static str {
+        if is_chinese() {
+            "移除仓库"
+        } else {
+            "Remove Repository"
+        }
+    }
+
+    pub fn tui_confirm_remove_repo_message(owner: &str, name: &str) -> String {
+        let repo = format!("{owner}/{name}");
+        if is_chinese() {
+            format!("确认移除仓库 '{repo}'？")
+        } else {
+            format!("Remove repository '{repo}'?")
+        }
+    }
+
+    pub fn tui_skills_unmanaged_title() -> &'static str {
+        if is_chinese() {
+            "未管理 Skills"
+        } else {
+            "Unmanaged Skills"
+        }
+    }
+
+    pub fn tui_skills_unmanaged_hint() -> &'static str {
+        if is_chinese() {
+            "扫描各 app 的 skills 目录，找出未被 ~/.cc-switch/skills.json 管理的技能。"
+        } else {
+            "Scan app skills folders and list skills not managed by ~/.cc-switch/skills.json."
+        }
+    }
+
+    pub fn tui_skills_unmanaged_empty() -> &'static str {
+        if is_chinese() {
+            "未发现未管理的技能。"
+        } else {
+            "No unmanaged skills found."
+        }
+    }
+
+    pub fn tui_skills_detail_title() -> &'static str {
+        if is_chinese() {
+            "Skill 详情"
+        } else {
+            "Skill Detail"
+        }
+    }
+
+    pub fn tui_skill_not_found() -> &'static str {
+        if is_chinese() {
+            "未找到该 Skill。"
+        } else {
+            "Skill not found."
+        }
+    }
+
+    pub fn tui_skills_sync_method_label() -> &'static str {
+        if is_chinese() {
+            "同步方式"
+        } else {
+            "Sync"
+        }
+    }
+
+    pub fn tui_skills_sync_method_title() -> &'static str {
+        if is_chinese() {
+            "选择同步方式"
+        } else {
+            "Select Sync Method"
+        }
+    }
+
+    pub fn tui_skills_sync_method_name(method: crate::services::skill::SyncMethod) -> &'static str {
+        match method {
+            crate::services::skill::SyncMethod::Auto => {
+                if is_chinese() {
+                    "auto（优先 symlink，失败回退 copy）"
+                } else {
+                    "auto (symlink, fallback copy)"
+                }
+            }
+            crate::services::skill::SyncMethod::Symlink => {
+                if is_chinese() {
+                    "symlink（仅软链接）"
+                } else {
+                    "symlink"
+                }
+            }
+            crate::services::skill::SyncMethod::Copy => {
+                if is_chinese() {
+                    "copy（仅复制）"
+                } else {
+                    "copy"
+                }
+            }
+        }
+    }
+
+    pub fn tui_skills_installed_summary(installed: usize, enabled: usize, app: &str) -> String {
+        if is_chinese() {
+            format!("已安装: {installed}   当前应用({app})已启用: {enabled}")
+        } else {
+            format!("Installed: {installed}   Enabled for {app}: {enabled}")
+        }
+    }
+
+    pub fn tui_skills_installed_counts(claude: usize, codex: usize, gemini: usize) -> String {
+        if is_chinese() {
+            format!("已安装 · Claude: {claude} · Codex: {codex} · Gemini: {gemini}")
+        } else {
+            format!("Installed · Claude: {claude} · Codex: {codex} · Gemini: {gemini}")
+        }
+    }
+
+    pub fn tui_skills_action_import_existing() -> &'static str {
+        if is_chinese() {
+            "导入已有"
+        } else {
+            "Import Existing"
+        }
+    }
+
+    pub fn tui_skills_empty_title() -> &'static str {
+        if is_chinese() {
+            "暂无已安装的技能"
+        } else {
+            "No installed skills"
+        }
+    }
+
+    pub fn tui_skills_empty_subtitle() -> &'static str {
+        if is_chinese() {
+            "导入本地已有的技能到 cc-switch"
+        } else {
+            "Import existing skills into cc-switch."
+        }
+    }
+
+    pub fn tui_skills_empty_hint() -> &'static str {
+        if is_chinese() {
+            "暂无已安装技能。按 a 安装，或按 f 发现。"
+        } else {
+            "No installed skills. Press a to install, or f to discover."
         }
     }
 
@@ -1622,6 +2170,185 @@ pub mod texts {
         }
     }
 
+    pub fn tui_toast_skills_worker_unavailable(err: &str) -> String {
+        if is_chinese() {
+            format!("Skills 后台任务不可用: {err}")
+        } else {
+            format!("Skills worker unavailable: {err}")
+        }
+    }
+
+    pub fn tui_error_skills_worker_unavailable() -> &'static str {
+        if is_chinese() {
+            "Skills 后台任务不可用。"
+        } else {
+            "Skills worker unavailable."
+        }
+    }
+
+    pub fn tui_toast_skills_discover_finished(count: usize) -> String {
+        if is_chinese() {
+            format!("发现完成：{count} 个结果。")
+        } else {
+            format!("Discover finished: {count} result(s).")
+        }
+    }
+
+    pub fn tui_toast_skills_discover_failed(err: &str) -> String {
+        if is_chinese() {
+            format!("发现失败: {err}")
+        } else {
+            format!("Discover failed: {err}")
+        }
+    }
+
+    pub fn tui_toast_skill_installed(directory: &str) -> String {
+        if is_chinese() {
+            format!("已安装: {directory}")
+        } else {
+            format!("Installed: {directory}")
+        }
+    }
+
+    pub fn tui_toast_skill_install_failed(spec: &str, err: &str) -> String {
+        if is_chinese() {
+            format!("安装失败（{spec}）: {err}")
+        } else {
+            format!("Install failed ({spec}): {err}")
+        }
+    }
+
+    pub fn tui_toast_skill_already_installed() -> &'static str {
+        if is_chinese() {
+            "该 Skill 已安装。"
+        } else {
+            "Skill already installed."
+        }
+    }
+
+    pub fn tui_toast_skill_spec_empty() -> &'static str {
+        if is_chinese() {
+            "Skill 不能为空。"
+        } else {
+            "Skill spec is empty."
+        }
+    }
+
+    pub fn tui_toast_skill_toggled(directory: &str, enabled: bool) -> String {
+        if is_chinese() {
+            format!("{} {directory}", if enabled { "已启用" } else { "已禁用" })
+        } else {
+            format!(
+                "{} {directory}",
+                if enabled { "Enabled" } else { "Disabled" }
+            )
+        }
+    }
+
+    pub fn tui_toast_skill_uninstalled(directory: &str) -> String {
+        if is_chinese() {
+            format!("已卸载: {directory}")
+        } else {
+            format!("Uninstalled: {directory}")
+        }
+    }
+
+    pub fn tui_toast_skills_synced() -> &'static str {
+        if is_chinese() {
+            "Skills 同步完成。"
+        } else {
+            "Skills synced."
+        }
+    }
+
+    pub fn tui_toast_skills_sync_method_set(method: &str) -> String {
+        if is_chinese() {
+            format!("同步方式已设置为: {method}")
+        } else {
+            format!("Sync method set to: {method}")
+        }
+    }
+
+    pub fn tui_toast_repo_spec_empty() -> &'static str {
+        if is_chinese() {
+            "仓库不能为空。"
+        } else {
+            "Repository is empty."
+        }
+    }
+
+    pub fn tui_error_repo_spec_empty() -> &'static str {
+        if is_chinese() {
+            "仓库不能为空。"
+        } else {
+            "Repository cannot be empty."
+        }
+    }
+
+    pub fn tui_error_repo_spec_invalid() -> &'static str {
+        if is_chinese() {
+            "仓库格式无效。请使用 owner/name 或 https://github.com/owner/name"
+        } else {
+            "Invalid repo format. Use owner/name or https://github.com/owner/name"
+        }
+    }
+
+    pub fn tui_toast_repo_added() -> &'static str {
+        if is_chinese() {
+            "仓库已添加。"
+        } else {
+            "Repository added."
+        }
+    }
+
+    pub fn tui_toast_repo_removed() -> &'static str {
+        if is_chinese() {
+            "仓库已移除。"
+        } else {
+            "Repository removed."
+        }
+    }
+
+    pub fn tui_toast_repo_toggled(enabled: bool) -> String {
+        if is_chinese() {
+            if enabled {
+                "仓库已启用。".to_string()
+            } else {
+                "仓库已禁用。".to_string()
+            }
+        } else {
+            if enabled {
+                "Repository enabled.".to_string()
+            } else {
+                "Repository disabled.".to_string()
+            }
+        }
+    }
+
+    pub fn tui_toast_unmanaged_scanned(count: usize) -> String {
+        if is_chinese() {
+            format!("扫描完成：发现 {count} 个未管理技能。")
+        } else {
+            format!("Scan finished: {count} unmanaged skill(s).")
+        }
+    }
+
+    pub fn tui_toast_no_unmanaged_selected() -> &'static str {
+        if is_chinese() {
+            "未选择任何技能。"
+        } else {
+            "No skills selected."
+        }
+    }
+
+    pub fn tui_toast_unmanaged_imported(count: usize) -> String {
+        if is_chinese() {
+            format!("已导入 {count} 个技能到 SSOT。")
+        } else {
+            format!("Imported {count} skill(s) into SSOT.")
+        }
+    }
+
     pub fn tui_toast_provider_deleted() -> &'static str {
         if is_chinese() {
             "供应商已删除。"
@@ -1964,9 +2691,9 @@ pub mod texts {
 
     pub fn menu_manage_skills() -> &'static str {
         if is_chinese() {
-            "🧩 管理 Skills"
+            "🧩 技能"
         } else {
-            "🧩 Manage Skills"
+            "🧩 Skills"
         }
     }
 

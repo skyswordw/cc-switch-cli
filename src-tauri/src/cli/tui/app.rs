@@ -1,12 +1,17 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::prelude::Size;
-use serde_json::Value;
+use std::collections::HashSet;
 
 use crate::app_config::AppType;
 use crate::cli::i18n::texts;
 use crate::cli::i18n::Language;
+use crate::services::skill::SyncMethod;
 
 use super::data::UiData;
+use super::form::{
+    CodexWireApi, FormFocus, FormMode, FormState, GeminiAuthType, McpAddField, McpAddFormState,
+    ProviderAddField, ProviderAddFormState,
+};
 use super::route::{NavItem, Route};
 
 #[derive(Debug, Clone)]
@@ -69,6 +74,8 @@ pub enum ConfirmAction {
     ProviderDelete { id: String },
     McpDelete { id: String },
     PromptDelete { id: String },
+    SkillsUninstall { directory: String },
+    SkillsRepoRemove { owner: String, name: String },
     ConfigImport { path: String },
     ConfigRestoreBackup { id: String },
     ConfigReset,
@@ -88,6 +95,9 @@ pub enum TextSubmit {
     ConfigImport,
     ConfigBackupName,
     McpValidateCommand,
+    SkillsInstallSpec,
+    SkillsDiscoverQuery,
+    SkillsRepoAdd,
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +131,13 @@ pub enum Overlay {
         name: String,
         selected: usize,
         apps: crate::app_config::McpApps,
+    },
+    SkillsSyncMethodPicker {
+        selected: usize,
+    },
+    Loading {
+        title: String,
+        message: String,
     },
     SpeedtestRunning {
         url: String,
@@ -336,6 +353,42 @@ pub enum Action {
     Quit,
     SetAppType(AppType),
 
+    SkillsToggle {
+        directory: String,
+        enabled: bool,
+    },
+    SkillsInstall {
+        spec: String,
+    },
+    SkillsUninstall {
+        directory: String,
+    },
+    SkillsSync {
+        app: Option<AppType>,
+    },
+    SkillsSetSyncMethod {
+        method: SyncMethod,
+    },
+    SkillsDiscover {
+        query: String,
+    },
+    SkillsRepoAdd {
+        spec: String,
+    },
+    SkillsRepoRemove {
+        owner: String,
+        name: String,
+    },
+    SkillsRepoToggleEnabled {
+        owner: String,
+        name: String,
+        enabled: bool,
+    },
+    SkillsScanUnmanaged,
+    SkillsImportFromApps {
+        directories: Vec<String>,
+    },
+
     ProviderSwitch {
         id: String,
     },
@@ -436,14 +489,24 @@ pub struct App {
 
     pub filter: FilterState,
     pub editor: Option<EditorState>,
+    pub form: Option<FormState>,
     pub overlay: Overlay,
     pub toast: Option<Toast>,
     pub should_quit: bool,
     pub last_size: Size,
+    pub tick: u64,
 
     pub provider_idx: usize,
     pub mcp_idx: usize,
     pub prompt_idx: usize,
+    pub skills_idx: usize,
+    pub skills_discover_idx: usize,
+    pub skills_repo_idx: usize,
+    pub skills_unmanaged_idx: usize,
+    pub skills_discover_results: Vec<crate::services::skill::Skill>,
+    pub skills_discover_query: String,
+    pub skills_unmanaged_results: Vec<crate::services::skill::UnmanagedSkill>,
+    pub skills_unmanaged_selected: HashSet<String>,
     pub config_idx: usize,
     pub language_idx: usize,
 }
@@ -459,13 +522,23 @@ impl App {
             nav_idx: 0,
             filter: FilterState::new(),
             editor: None,
+            form: None,
             overlay: Overlay::None,
             toast: None,
             should_quit: false,
             last_size: Size::new(0, 0),
+            tick: 0,
             provider_idx: 0,
             mcp_idx: 0,
             prompt_idx: 0,
+            skills_idx: 0,
+            skills_discover_idx: 0,
+            skills_repo_idx: 0,
+            skills_unmanaged_idx: 0,
+            skills_discover_results: Vec::new(),
+            skills_discover_query: String::new(),
+            skills_unmanaged_results: Vec::new(),
+            skills_unmanaged_selected: HashSet::new(),
             config_idx: 0,
             language_idx: 0,
         }
@@ -485,6 +558,11 @@ impl App {
             Route::Mcp => NavItem::Mcp,
             Route::Prompts => NavItem::Prompts,
             Route::Config => NavItem::Config,
+            Route::Skills
+            | Route::SkillsDiscover
+            | Route::SkillsRepos
+            | Route::SkillsUnmanaged
+            | Route::SkillDetail { .. } => NavItem::Skills,
             Route::Settings => NavItem::Settings,
         }
     }
@@ -527,6 +605,7 @@ impl App {
     }
 
     pub fn on_tick(&mut self) {
+        self.tick = self.tick.wrapping_add(1);
         if let Some(toast) = &mut self.toast {
             if toast.remaining_ticks > 0 {
                 toast.remaining_ticks -= 1;
@@ -563,6 +642,10 @@ impl App {
 
         if self.editor.is_some() {
             return self.on_editor_key(key);
+        }
+
+        if self.form.is_some() {
+            return self.on_form_key(key, data);
         }
 
         if self.filter.active {
@@ -675,8 +758,221 @@ impl App {
             Route::Mcp => self.on_mcp_key(key, data),
             Route::Prompts => self.on_prompts_key(key, data),
             Route::Config => self.on_config_key(key, data),
+            Route::Skills => self.on_skills_installed_key(key, data),
+            Route::SkillsDiscover => self.on_skills_discover_key(key),
+            Route::SkillsRepos => self.on_skills_repos_key(key, data),
+            Route::SkillsUnmanaged => self.on_skills_unmanaged_key(key),
+            Route::SkillDetail { directory } => self.on_skill_detail_key(key, data, &directory),
             Route::Settings => self.on_settings_key(key),
             Route::Main => Action::None,
+        }
+    }
+
+    fn on_skills_installed_key(&mut self, key: KeyEvent, data: &UiData) -> Action {
+        let visible = visible_skills_installed(&self.filter, data);
+
+        match key.code {
+            KeyCode::Up => {
+                self.skills_idx = self.skills_idx.saturating_sub(1);
+                Action::None
+            }
+            KeyCode::Down => {
+                if !visible.is_empty() {
+                    self.skills_idx = (self.skills_idx + 1).min(visible.len() - 1);
+                }
+                Action::None
+            }
+            KeyCode::Enter => {
+                let Some(skill) = visible.get(self.skills_idx) else {
+                    return Action::None;
+                };
+                self.push_route_and_switch(Route::SkillDetail {
+                    directory: skill.directory.clone(),
+                })
+            }
+            KeyCode::Char('x') | KeyCode::Char(' ') => {
+                let Some(skill) = visible.get(self.skills_idx) else {
+                    return Action::None;
+                };
+                let enabled = !skill.apps.is_enabled_for(&self.app_type);
+                Action::SkillsToggle {
+                    directory: skill.directory.clone(),
+                    enabled,
+                }
+            }
+            KeyCode::Char('i') => self.push_route_and_switch(Route::SkillsUnmanaged),
+            _ => Action::None,
+        }
+    }
+
+    fn on_skills_discover_key(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Up => {
+                self.skills_discover_idx = self.skills_discover_idx.saturating_sub(1);
+                Action::None
+            }
+            KeyCode::Down => {
+                let visible = visible_skills_discover(&self.filter, &self.skills_discover_results);
+                if !visible.is_empty() {
+                    self.skills_discover_idx =
+                        (self.skills_discover_idx + 1).min(visible.len() - 1);
+                }
+                Action::None
+            }
+            KeyCode::Char('f') => {
+                self.overlay = Overlay::TextInput(TextInputState {
+                    title: texts::tui_skills_discover_title().to_string(),
+                    prompt: texts::tui_skills_discover_prompt().to_string(),
+                    buffer: self.skills_discover_query.clone(),
+                    submit: TextSubmit::SkillsDiscoverQuery,
+                });
+                Action::None
+            }
+            KeyCode::Enter => {
+                let visible = visible_skills_discover(&self.filter, &self.skills_discover_results);
+                let Some(skill) = visible.get(self.skills_discover_idx) else {
+                    return Action::None;
+                };
+                if skill.installed {
+                    self.push_toast(texts::tui_toast_skill_already_installed(), ToastKind::Info);
+                    return Action::None;
+                }
+                Action::SkillsInstall {
+                    spec: skill.key.clone(),
+                }
+            }
+            KeyCode::Char('r') => self.push_route_and_switch(Route::SkillsRepos),
+            _ => Action::None,
+        }
+    }
+
+    fn on_skills_repos_key(&mut self, key: KeyEvent, data: &UiData) -> Action {
+        let visible = visible_skills_repos(&self.filter, data);
+        match key.code {
+            KeyCode::Up => {
+                self.skills_repo_idx = self.skills_repo_idx.saturating_sub(1);
+                Action::None
+            }
+            KeyCode::Down => {
+                if !visible.is_empty() {
+                    self.skills_repo_idx = (self.skills_repo_idx + 1).min(visible.len() - 1);
+                }
+                Action::None
+            }
+            KeyCode::Char('a') => {
+                self.overlay = Overlay::TextInput(TextInputState {
+                    title: texts::tui_skills_repos_add_title().to_string(),
+                    prompt: texts::tui_skills_repos_add_prompt().to_string(),
+                    buffer: String::new(),
+                    submit: TextSubmit::SkillsRepoAdd,
+                });
+                Action::None
+            }
+            KeyCode::Char('d') => {
+                let Some(repo) = visible.get(self.skills_repo_idx) else {
+                    return Action::None;
+                };
+                self.overlay = Overlay::Confirm(ConfirmOverlay {
+                    title: texts::tui_skills_repos_remove_title().to_string(),
+                    message: texts::tui_confirm_remove_repo_message(&repo.owner, &repo.name),
+                    action: ConfirmAction::SkillsRepoRemove {
+                        owner: repo.owner.clone(),
+                        name: repo.name.clone(),
+                    },
+                });
+                Action::None
+            }
+            KeyCode::Char('x') | KeyCode::Char(' ') => {
+                let Some(repo) = visible.get(self.skills_repo_idx) else {
+                    return Action::None;
+                };
+                Action::SkillsRepoToggleEnabled {
+                    owner: repo.owner.clone(),
+                    name: repo.name.clone(),
+                    enabled: !repo.enabled,
+                }
+            }
+            _ => Action::None,
+        }
+    }
+
+    fn on_skills_unmanaged_key(&mut self, key: KeyEvent) -> Action {
+        let visible = visible_skills_unmanaged(&self.filter, &self.skills_unmanaged_results);
+        match key.code {
+            KeyCode::Up => {
+                self.skills_unmanaged_idx = self.skills_unmanaged_idx.saturating_sub(1);
+                Action::None
+            }
+            KeyCode::Down => {
+                if !visible.is_empty() {
+                    self.skills_unmanaged_idx =
+                        (self.skills_unmanaged_idx + 1).min(visible.len() - 1);
+                }
+                Action::None
+            }
+            KeyCode::Char('x') | KeyCode::Char(' ') | KeyCode::Enter => {
+                let Some(skill) = visible.get(self.skills_unmanaged_idx) else {
+                    return Action::None;
+                };
+                if self.skills_unmanaged_selected.contains(&skill.directory) {
+                    self.skills_unmanaged_selected.remove(&skill.directory);
+                } else {
+                    self.skills_unmanaged_selected
+                        .insert(skill.directory.clone());
+                }
+                Action::None
+            }
+            KeyCode::Char('i') => {
+                if self.skills_unmanaged_selected.is_empty() {
+                    self.push_toast(texts::tui_toast_no_unmanaged_selected(), ToastKind::Info);
+                    return Action::None;
+                }
+                let mut directories = self
+                    .skills_unmanaged_selected
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                directories.sort();
+                Action::SkillsImportFromApps { directories }
+            }
+            KeyCode::Char('r') => Action::SkillsScanUnmanaged,
+            _ => Action::None,
+        }
+    }
+
+    fn on_skill_detail_key(&mut self, key: KeyEvent, data: &UiData, directory: &str) -> Action {
+        let Some(skill) = data
+            .skills
+            .installed
+            .iter()
+            .find(|s| s.directory.eq_ignore_ascii_case(directory))
+        else {
+            return Action::None;
+        };
+
+        match key.code {
+            KeyCode::Char('x') | KeyCode::Char(' ') => Action::SkillsToggle {
+                directory: skill.directory.clone(),
+                enabled: !skill.apps.is_enabled_for(&self.app_type),
+            },
+            KeyCode::Char('d') => {
+                self.overlay = Overlay::Confirm(ConfirmOverlay {
+                    title: texts::tui_skills_uninstall_title().to_string(),
+                    message: texts::tui_confirm_uninstall_skill_message(
+                        &skill.name,
+                        &skill.directory,
+                    ),
+                    action: ConfirmAction::SkillsUninstall {
+                        directory: skill.directory.clone(),
+                    },
+                });
+                Action::None
+            }
+            KeyCode::Char('s') => Action::SkillsSync {
+                app: Some(self.app_type.clone()),
+            },
+            KeyCode::Char('S') => Action::SkillsSync { app: None },
+            _ => Action::None,
         }
     }
 
@@ -700,26 +996,14 @@ impl App {
                 self.push_route_and_switch(Route::ProviderDetail { id: row.id.clone() })
             }
             KeyCode::Char('a') => {
-                let template = serde_json::json!({
-                    "id": "",
-                    "name": "",
-                    "settingsConfig": {}
-                });
-                let json =
-                    serde_json::to_string_pretty(&template).unwrap_or_else(|_| "{}".to_string());
-                self.open_editor(
-                    texts::tui_provider_add_title(),
-                    EditorKind::Json,
-                    json,
-                    EditorSubmit::ProviderAdd,
-                );
+                self.open_provider_add_form();
                 Action::None
             }
             KeyCode::Char('e') => {
                 let Some(row) = visible.get(self.provider_idx) else {
                     return Action::None;
                 };
-                self.open_provider_editor(row);
+                self.open_provider_edit_form(row);
                 Action::None
             }
             KeyCode::Char('s') => {
@@ -775,7 +1059,7 @@ impl App {
 
         match key.code {
             KeyCode::Char('e') => {
-                self.open_provider_editor(row);
+                self.open_provider_edit_form(row);
                 Action::None
             }
             KeyCode::Enter => Action::None,
@@ -798,23 +1082,6 @@ impl App {
         }
     }
 
-    fn open_provider_editor(&mut self, row: &super::data::ProviderRow) {
-        let value =
-            serde_json::to_value(&row.provider).unwrap_or(Value::Object(Default::default()));
-        let display = strip_provider_internal_fields(&value);
-        let json = serde_json::to_string_pretty(&display).unwrap_or_else(|_| "{}".to_string());
-        self.open_editor(
-            format!(
-                "{}: {}",
-                texts::tui_provider_detail_title(),
-                row.provider.name
-            ),
-            EditorKind::Json,
-            json,
-            EditorSubmit::ProviderEdit { id: row.id.clone() },
-        );
-    }
-
     fn on_mcp_key(&mut self, key: KeyEvent, data: &UiData) -> Action {
         let visible = visible_mcp(&self.filter, data);
         match key.code {
@@ -829,43 +1096,14 @@ impl App {
                 Action::None
             }
             KeyCode::Char('a') => {
-                let mut apps = crate::app_config::McpApps::default();
-                apps.set_enabled_for(&self.app_type, true);
-                let template = crate::app_config::McpServer {
-                    id: String::new(),
-                    name: String::new(),
-                    server: serde_json::json!({
-                        "command": "",
-                        "args": [],
-                    }),
-                    apps,
-                    description: None,
-                    homepage: None,
-                    docs: None,
-                    tags: vec![],
-                };
-                let json =
-                    serde_json::to_string_pretty(&template).unwrap_or_else(|_| "{}".to_string());
-                self.open_editor(
-                    texts::tui_mcp_add_title(),
-                    EditorKind::Json,
-                    json,
-                    EditorSubmit::McpAdd,
-                );
+                self.open_mcp_add_form();
                 Action::None
             }
             KeyCode::Char('e') => {
                 let Some(row) = visible.get(self.mcp_idx) else {
                     return Action::None;
                 };
-                let json =
-                    serde_json::to_string_pretty(&row.server).unwrap_or_else(|_| "{}".to_string());
-                self.open_editor(
-                    texts::tui_mcp_edit_title(&row.server.name),
-                    EditorKind::Json,
-                    json,
-                    EditorSubmit::McpEdit { id: row.id.clone() },
-                );
+                self.open_mcp_edit_form(row);
                 Action::None
             }
             KeyCode::Char('x') => {
@@ -1158,6 +1396,15 @@ impl App {
                         ConfirmAction::PromptDelete { id } => {
                             Action::PromptDelete { id: id.clone() }
                         }
+                        ConfirmAction::SkillsUninstall { directory } => Action::SkillsUninstall {
+                            directory: directory.clone(),
+                        },
+                        ConfirmAction::SkillsRepoRemove { owner, name } => {
+                            Action::SkillsRepoRemove {
+                                owner: owner.clone(),
+                                name: name.clone(),
+                            }
+                        }
                         ConfirmAction::ConfigImport { path } => {
                             Action::ConfigImport { path: path.clone() }
                         }
@@ -1224,6 +1471,30 @@ impl App {
                                 return Action::None;
                             }
                             Action::McpValidate { command: raw }
+                        }
+                        TextSubmit::SkillsInstallSpec => {
+                            if raw.is_empty() {
+                                self.push_toast(
+                                    texts::tui_toast_skill_spec_empty(),
+                                    ToastKind::Warning,
+                                );
+                                return Action::None;
+                            }
+                            Action::SkillsInstall { spec: raw }
+                        }
+                        TextSubmit::SkillsDiscoverQuery => {
+                            self.skills_discover_query = raw.clone();
+                            Action::SkillsDiscover { query: raw }
+                        }
+                        TextSubmit::SkillsRepoAdd => {
+                            if raw.is_empty() {
+                                self.push_toast(
+                                    texts::tui_toast_repo_spec_empty(),
+                                    ToastKind::Warning,
+                                );
+                                return Action::None;
+                            }
+                            Action::SkillsRepoAdd { spec: raw }
                         }
                     }
                 }
@@ -1309,6 +1580,38 @@ impl App {
                 }
                 _ => Action::None,
             },
+            Overlay::SkillsSyncMethodPicker { selected } => match key.code {
+                KeyCode::Esc => {
+                    self.overlay = Overlay::None;
+                    Action::None
+                }
+                KeyCode::Up => {
+                    *selected = selected.saturating_sub(1);
+                    Action::None
+                }
+                KeyCode::Down => {
+                    *selected = (*selected + 1).min(2);
+                    Action::None
+                }
+                KeyCode::Enter => {
+                    let method = sync_method_for_picker_index(*selected);
+                    let unchanged = method == data.skills.sync_method;
+                    self.overlay = Overlay::None;
+                    if unchanged {
+                        Action::None
+                    } else {
+                        Action::SkillsSetSyncMethod { method }
+                    }
+                }
+                _ => Action::None,
+            },
+            Overlay::Loading { .. } => match key.code {
+                KeyCode::Esc => {
+                    self.overlay = Overlay::None;
+                    Action::None
+                }
+                _ => Action::None,
+            },
             Overlay::McpAppsPicker {
                 id, selected, apps, ..
             } => match key.code {
@@ -1388,6 +1691,521 @@ impl App {
         self.overlay = Overlay::None;
         self.focus = Focus::Content;
         self.editor = Some(EditorState::new(title, kind, submit, initial));
+    }
+
+    fn open_common_snippet_editor(&mut self, data: &UiData) {
+        let snippet = if data.config.common_snippet.trim().is_empty() {
+            texts::tui_default_common_snippet().to_string()
+        } else {
+            data.config.common_snippet.clone()
+        };
+
+        self.open_editor(
+            texts::tui_common_snippet_title(self.app_type.as_str()),
+            EditorKind::Json,
+            snippet,
+            EditorSubmit::ConfigCommonSnippet,
+        );
+    }
+
+    fn open_provider_add_form(&mut self) {
+        self.filter.active = false;
+        self.overlay = Overlay::None;
+        self.focus = Focus::Content;
+        self.editor = None;
+        self.form = Some(FormState::ProviderAdd(ProviderAddFormState::new(
+            self.app_type.clone(),
+        )));
+    }
+
+    fn open_provider_edit_form(&mut self, row: &super::data::ProviderRow) {
+        self.filter.active = false;
+        self.overlay = Overlay::None;
+        self.focus = Focus::Content;
+        self.editor = None;
+        self.form = Some(FormState::ProviderAdd(ProviderAddFormState::from_provider(
+            self.app_type.clone(),
+            &row.provider,
+        )));
+    }
+
+    fn open_mcp_add_form(&mut self) {
+        self.filter.active = false;
+        self.overlay = Overlay::None;
+        self.focus = Focus::Content;
+        self.editor = None;
+        let mut state = McpAddFormState::new();
+        state.apps.set_enabled_for(&self.app_type, true);
+        self.form = Some(FormState::McpAdd(state));
+    }
+
+    fn open_mcp_edit_form(&mut self, row: &super::data::McpRow) {
+        self.filter.active = false;
+        self.overlay = Overlay::None;
+        self.focus = Focus::Content;
+        self.editor = None;
+        self.form = Some(FormState::McpAdd(McpAddFormState::from_server(&row.server)));
+    }
+
+    fn on_form_key(&mut self, key: KeyEvent, data: &UiData) -> Action {
+        let Some(form) = &mut self.form else {
+            return Action::None;
+        };
+
+        if matches!(key.code, KeyCode::Tab) {
+            match form {
+                FormState::ProviderAdd(provider) => {
+                    provider.focus = match (&provider.mode, provider.focus) {
+                        (FormMode::Add, FormFocus::Templates) => FormFocus::Fields,
+                        (FormMode::Add, FormFocus::Fields) => FormFocus::JsonPreview,
+                        (FormMode::Add, FormFocus::JsonPreview) => FormFocus::Templates,
+                        (FormMode::Edit { .. }, FormFocus::Fields) => FormFocus::JsonPreview,
+                        (FormMode::Edit { .. }, FormFocus::JsonPreview) => FormFocus::Fields,
+                        (FormMode::Edit { .. }, FormFocus::Templates) => FormFocus::Fields,
+                    };
+                }
+                FormState::McpAdd(mcp) => {
+                    mcp.focus = match (&mcp.mode, mcp.focus) {
+                        (FormMode::Add, FormFocus::Templates) => FormFocus::Fields,
+                        (FormMode::Add, FormFocus::Fields) => FormFocus::JsonPreview,
+                        (FormMode::Add, FormFocus::JsonPreview) => FormFocus::Templates,
+                        (FormMode::Edit { .. }, FormFocus::Fields) => FormFocus::JsonPreview,
+                        (FormMode::Edit { .. }, FormFocus::JsonPreview) => FormFocus::Fields,
+                        (FormMode::Edit { .. }, FormFocus::Templates) => FormFocus::Fields,
+                    };
+                }
+            }
+            return Action::None;
+        }
+
+        if let FormState::ProviderAdd(provider) = form {
+            if provider.focus == FormFocus::Templates && matches!(provider.mode, FormMode::Add) {
+                match key.code {
+                    KeyCode::Left => {
+                        provider.template_idx = provider.template_idx.saturating_sub(1);
+                        return Action::None;
+                    }
+                    KeyCode::Right => {
+                        let max = provider.template_count().saturating_sub(1);
+                        provider.template_idx = (provider.template_idx + 1).min(max);
+                        return Action::None;
+                    }
+                    KeyCode::Enter => {
+                        let existing_ids = data
+                            .providers
+                            .rows
+                            .iter()
+                            .map(|row| row.id.clone())
+                            .collect::<Vec<_>>();
+                        provider.apply_template(provider.template_idx, &existing_ids);
+                        provider.focus = FormFocus::Fields;
+                        return Action::None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if let FormState::McpAdd(mcp) = form {
+            if mcp.focus == FormFocus::Templates && matches!(mcp.mode, FormMode::Add) {
+                match key.code {
+                    KeyCode::Left => {
+                        mcp.template_idx = mcp.template_idx.saturating_sub(1);
+                        return Action::None;
+                    }
+                    KeyCode::Right => {
+                        let max = mcp.template_count().saturating_sub(1);
+                        mcp.template_idx = (mcp.template_idx + 1).min(max);
+                        return Action::None;
+                    }
+                    KeyCode::Enter => {
+                        mcp.apply_template(mcp.template_idx);
+                        mcp.focus = FormFocus::Fields;
+                        return Action::None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if let FormState::ProviderAdd(provider) = form {
+            if provider.focus == FormFocus::Fields {
+                let fields = provider.fields();
+                if !fields.is_empty() {
+                    provider.field_idx = provider.field_idx.min(fields.len() - 1);
+                } else {
+                    provider.field_idx = 0;
+                }
+
+                let Some(selected) = fields.get(provider.field_idx).copied() else {
+                    return Action::None;
+                };
+
+                if provider.editing {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Enter => {
+                            provider.editing = false;
+                            return Action::None;
+                        }
+                        KeyCode::Left => {
+                            if let Some(input) = provider.input_mut(selected) {
+                                input.move_left();
+                            }
+                            return Action::None;
+                        }
+                        KeyCode::Right => {
+                            if let Some(input) = provider.input_mut(selected) {
+                                input.move_right();
+                            }
+                            return Action::None;
+                        }
+                        KeyCode::Home => {
+                            if let Some(input) = provider.input_mut(selected) {
+                                input.move_home();
+                            }
+                            return Action::None;
+                        }
+                        KeyCode::End => {
+                            if let Some(input) = provider.input_mut(selected) {
+                                input.move_end();
+                            }
+                            return Action::None;
+                        }
+                        KeyCode::Backspace => {
+                            let changed = provider
+                                .input_mut(selected)
+                                .map(|input| input.backspace())
+                                .unwrap_or(false);
+                            if changed && selected == ProviderAddField::Id {
+                                provider.id_is_manual = true;
+                            }
+                            if changed
+                                && selected == ProviderAddField::Name
+                                && !provider.id_is_manual
+                            {
+                                let existing_ids = data
+                                    .providers
+                                    .rows
+                                    .iter()
+                                    .map(|row| row.id.clone())
+                                    .collect::<Vec<_>>();
+                                provider.id.set(
+                                    crate::cli::commands::provider_input::generate_provider_id(
+                                        provider.name.value.trim(),
+                                        &existing_ids,
+                                    ),
+                                );
+                            }
+                            return Action::None;
+                        }
+                        KeyCode::Delete => {
+                            let changed = provider
+                                .input_mut(selected)
+                                .map(|input| input.delete())
+                                .unwrap_or(false);
+                            if changed && selected == ProviderAddField::Id {
+                                provider.id_is_manual = true;
+                            }
+                            if changed
+                                && selected == ProviderAddField::Name
+                                && !provider.id_is_manual
+                            {
+                                let existing_ids = data
+                                    .providers
+                                    .rows
+                                    .iter()
+                                    .map(|row| row.id.clone())
+                                    .collect::<Vec<_>>();
+                                provider.id.set(
+                                    crate::cli::commands::provider_input::generate_provider_id(
+                                        provider.name.value.trim(),
+                                        &existing_ids,
+                                    ),
+                                );
+                            }
+                            return Action::None;
+                        }
+                        KeyCode::Char(c) => {
+                            if c.is_control() {
+                                return Action::None;
+                            }
+                            let changed = provider
+                                .input_mut(selected)
+                                .map(|input| input.insert_char(c))
+                                .unwrap_or(false);
+                            if changed && selected == ProviderAddField::Id {
+                                provider.id_is_manual = true;
+                            }
+                            if changed
+                                && selected == ProviderAddField::Name
+                                && !provider.id_is_manual
+                            {
+                                let existing_ids = data
+                                    .providers
+                                    .rows
+                                    .iter()
+                                    .map(|row| row.id.clone())
+                                    .collect::<Vec<_>>();
+                                provider.id.set(
+                                    crate::cli::commands::provider_input::generate_provider_id(
+                                        provider.name.value.trim(),
+                                        &existing_ids,
+                                    ),
+                                );
+                            }
+                            return Action::None;
+                        }
+                        _ => {}
+                    }
+                } else {
+                    match key.code {
+                        KeyCode::Up => {
+                            provider.field_idx = provider.field_idx.saturating_sub(1);
+                            return Action::None;
+                        }
+                        KeyCode::Down => {
+                            provider.field_idx = (provider.field_idx + 1).min(fields.len() - 1);
+                            return Action::None;
+                        }
+                        KeyCode::Char(' ') | KeyCode::Enter => match selected {
+                            ProviderAddField::CodexWireApi => {
+                                provider.codex_wire_api = match provider.codex_wire_api {
+                                    CodexWireApi::Chat => CodexWireApi::Responses,
+                                    CodexWireApi::Responses => CodexWireApi::Chat,
+                                };
+                                return Action::None;
+                            }
+                            ProviderAddField::CodexRequiresOpenaiAuth => {
+                                provider.codex_requires_openai_auth =
+                                    !provider.codex_requires_openai_auth;
+                                return Action::None;
+                            }
+                            ProviderAddField::IncludeCommonConfig => {
+                                provider.include_common_config = !provider.include_common_config;
+                                return Action::None;
+                            }
+                            ProviderAddField::GeminiAuthType => {
+                                provider.gemini_auth_type = match provider.gemini_auth_type {
+                                    GeminiAuthType::OAuth => GeminiAuthType::ApiKey,
+                                    GeminiAuthType::ApiKey => GeminiAuthType::OAuth,
+                                };
+                                return Action::None;
+                            }
+                            _ => {
+                                if selected == ProviderAddField::Id && !provider.is_id_editable() {
+                                    return Action::None;
+                                }
+                                if provider.input(selected).is_some() {
+                                    provider.editing = true;
+                                }
+                                return Action::None;
+                            }
+                        },
+                        _ => {}
+                    }
+                }
+            } else if provider.focus == FormFocus::JsonPreview {
+                match key.code {
+                    KeyCode::Up => {
+                        provider.json_scroll = provider.json_scroll.saturating_sub(1);
+                        return Action::None;
+                    }
+                    KeyCode::Down => {
+                        provider.json_scroll = provider.json_scroll.saturating_add(1);
+                        return Action::None;
+                    }
+                    KeyCode::PageUp => {
+                        provider.json_scroll = provider.json_scroll.saturating_sub(10);
+                        return Action::None;
+                    }
+                    KeyCode::PageDown => {
+                        provider.json_scroll = provider.json_scroll.saturating_add(10);
+                        return Action::None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if let FormState::McpAdd(mcp) = form {
+            if mcp.focus == FormFocus::Fields {
+                let fields = mcp.fields();
+                if !fields.is_empty() {
+                    mcp.field_idx = mcp.field_idx.min(fields.len() - 1);
+                } else {
+                    mcp.field_idx = 0;
+                }
+
+                let Some(selected) = fields.get(mcp.field_idx).copied() else {
+                    return Action::None;
+                };
+
+                if mcp.editing {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Enter => {
+                            mcp.editing = false;
+                            return Action::None;
+                        }
+                        KeyCode::Left => {
+                            if let Some(input) = mcp.input_mut(selected) {
+                                input.move_left();
+                            }
+                            return Action::None;
+                        }
+                        KeyCode::Right => {
+                            if let Some(input) = mcp.input_mut(selected) {
+                                input.move_right();
+                            }
+                            return Action::None;
+                        }
+                        KeyCode::Home => {
+                            if let Some(input) = mcp.input_mut(selected) {
+                                input.move_home();
+                            }
+                            return Action::None;
+                        }
+                        KeyCode::End => {
+                            if let Some(input) = mcp.input_mut(selected) {
+                                input.move_end();
+                            }
+                            return Action::None;
+                        }
+                        KeyCode::Backspace => {
+                            let _ = mcp.input_mut(selected).map(|input| input.backspace());
+                            return Action::None;
+                        }
+                        KeyCode::Delete => {
+                            let _ = mcp.input_mut(selected).map(|input| input.delete());
+                            return Action::None;
+                        }
+                        KeyCode::Char(c) => {
+                            if c.is_control() {
+                                return Action::None;
+                            }
+                            let _ = mcp.input_mut(selected).map(|input| input.insert_char(c));
+                            return Action::None;
+                        }
+                        _ => {}
+                    }
+                } else {
+                    match key.code {
+                        KeyCode::Up => {
+                            mcp.field_idx = mcp.field_idx.saturating_sub(1);
+                            return Action::None;
+                        }
+                        KeyCode::Down => {
+                            mcp.field_idx = (mcp.field_idx + 1).min(fields.len() - 1);
+                            return Action::None;
+                        }
+                        KeyCode::Char(' ') | KeyCode::Enter => match selected {
+                            McpAddField::AppClaude => {
+                                mcp.apps.claude = !mcp.apps.claude;
+                                return Action::None;
+                            }
+                            McpAddField::AppCodex => {
+                                mcp.apps.codex = !mcp.apps.codex;
+                                return Action::None;
+                            }
+                            McpAddField::AppGemini => {
+                                mcp.apps.gemini = !mcp.apps.gemini;
+                                return Action::None;
+                            }
+                            _ => {
+                                if selected == McpAddField::Id && mcp.locked_id().is_some() {
+                                    return Action::None;
+                                }
+                                if mcp.input(selected).is_some() {
+                                    mcp.editing = true;
+                                }
+                                return Action::None;
+                            }
+                        },
+                        _ => {}
+                    }
+                }
+            } else if mcp.focus == FormFocus::JsonPreview {
+                match key.code {
+                    KeyCode::Up => {
+                        mcp.json_scroll = mcp.json_scroll.saturating_sub(1);
+                        return Action::None;
+                    }
+                    KeyCode::Down => {
+                        mcp.json_scroll = mcp.json_scroll.saturating_add(1);
+                        return Action::None;
+                    }
+                    KeyCode::PageUp => {
+                        mcp.json_scroll = mcp.json_scroll.saturating_sub(10);
+                        return Action::None;
+                    }
+                    KeyCode::PageDown => {
+                        mcp.json_scroll = mcp.json_scroll.saturating_add(10);
+                        return Action::None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('s')) {
+            match form {
+                FormState::ProviderAdd(provider) => {
+                    if !provider.has_required_fields() {
+                        if provider.mode.is_edit() {
+                            self.push_toast(
+                                texts::tui_toast_provider_missing_name(),
+                                ToastKind::Warning,
+                            );
+                            return Action::None;
+                        }
+                        self.push_toast(
+                            texts::tui_toast_provider_add_missing_fields(),
+                            ToastKind::Warning,
+                        );
+                        return Action::None;
+                    }
+
+                    let content = serde_json::to_string_pretty(&provider.to_provider_json_value())
+                        .unwrap_or_else(|_| "{}".to_string());
+
+                    return Action::EditorSubmit {
+                        submit: match &provider.mode {
+                            FormMode::Add => EditorSubmit::ProviderAdd,
+                            FormMode::Edit { id } => EditorSubmit::ProviderEdit { id: id.clone() },
+                        },
+                        content,
+                    };
+                }
+                FormState::McpAdd(mcp) => {
+                    if !mcp.has_required_fields() {
+                        self.push_toast(texts::tui_toast_mcp_missing_fields(), ToastKind::Warning);
+                        return Action::None;
+                    }
+                    if mcp.command.is_blank() {
+                        self.push_toast(texts::tui_toast_command_empty(), ToastKind::Warning);
+                        return Action::None;
+                    }
+
+                    let content = serde_json::to_string_pretty(&mcp.to_mcp_server_json_value())
+                        .unwrap_or_else(|_| "{}".to_string());
+
+                    return Action::EditorSubmit {
+                        submit: match &mcp.mode {
+                            FormMode::Add => EditorSubmit::McpAdd,
+                            FormMode::Edit { id } => EditorSubmit::McpEdit { id: id.clone() },
+                        },
+                        content,
+                    };
+                }
+            }
+        }
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.form = None;
+                Action::None
+            }
+            _ => Action::None,
+        }
     }
 
     fn on_editor_key(&mut self, key: KeyEvent) -> Action {
@@ -1582,6 +2400,36 @@ impl App {
             self.prompt_idx = self.prompt_idx.min(prompt_len - 1);
         }
 
+        let skills_len = visible_skills_installed(&self.filter, data).len();
+        if skills_len == 0 {
+            self.skills_idx = 0;
+        } else {
+            self.skills_idx = self.skills_idx.min(skills_len - 1);
+        }
+
+        let discover_len =
+            visible_skills_discover(&self.filter, &self.skills_discover_results).len();
+        if discover_len == 0 {
+            self.skills_discover_idx = 0;
+        } else {
+            self.skills_discover_idx = self.skills_discover_idx.min(discover_len - 1);
+        }
+
+        let repos_len = visible_skills_repos(&self.filter, data).len();
+        if repos_len == 0 {
+            self.skills_repo_idx = 0;
+        } else {
+            self.skills_repo_idx = self.skills_repo_idx.min(repos_len - 1);
+        }
+
+        let unmanaged_len =
+            visible_skills_unmanaged(&self.filter, &self.skills_unmanaged_results).len();
+        if unmanaged_len == 0 {
+            self.skills_unmanaged_idx = 0;
+        } else {
+            self.skills_unmanaged_idx = self.skills_unmanaged_idx.min(unmanaged_len - 1);
+        }
+
         let config_len = visible_config_items(&self.filter).len();
         if config_len == 0 {
             self.config_idx = 0;
@@ -1599,6 +2447,11 @@ fn route_has_content_list(route: &Route) -> bool {
             | Route::Mcp
             | Route::Prompts
             | Route::Config
+            | Route::Skills
+            | Route::SkillsDiscover
+            | Route::SkillsRepos
+            | Route::SkillsUnmanaged
+            | Route::SkillDetail { .. }
             | Route::Settings
     )
 }
@@ -1650,6 +2503,92 @@ fn visible_prompts<'a>(filter: &FilterState, data: &'a UiData) -> Vec<&'a super:
             None => true,
             Some(q) => {
                 row.prompt.name.to_lowercase().contains(q) || row.id.to_lowercase().contains(q)
+            }
+        })
+        .collect()
+}
+
+fn visible_skills_installed<'a>(
+    filter: &FilterState,
+    data: &'a UiData,
+) -> Vec<&'a crate::services::skill::InstalledSkill> {
+    let query = filter.query_lower();
+    data.skills
+        .installed
+        .iter()
+        .filter(|skill| match &query {
+            None => true,
+            Some(q) => {
+                skill.name.to_lowercase().contains(q)
+                    || skill.directory.to_lowercase().contains(q)
+                    || skill.id.to_lowercase().contains(q)
+            }
+        })
+        .collect()
+}
+
+fn visible_skills_discover<'a>(
+    filter: &FilterState,
+    skills: &'a [crate::services::skill::Skill],
+) -> Vec<&'a crate::services::skill::Skill> {
+    let query = filter.query_lower();
+    skills
+        .iter()
+        .filter(|skill| match &query {
+            None => true,
+            Some(q) => {
+                skill.name.to_lowercase().contains(q)
+                    || skill.directory.to_lowercase().contains(q)
+                    || skill.key.to_lowercase().contains(q)
+            }
+        })
+        .collect()
+}
+
+fn visible_skills_repos<'a>(
+    filter: &FilterState,
+    data: &'a UiData,
+) -> Vec<&'a crate::services::skill::SkillRepo> {
+    let query = filter.query_lower();
+    data.skills
+        .repos
+        .iter()
+        .filter(|repo| match &query {
+            None => true,
+            Some(q) => {
+                repo.owner.to_lowercase().contains(q)
+                    || repo.name.to_lowercase().contains(q)
+                    || repo.branch.to_lowercase().contains(q)
+                    || repo
+                        .skills_path
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_lowercase()
+                        .contains(q)
+            }
+        })
+        .collect()
+}
+
+fn visible_skills_unmanaged<'a>(
+    filter: &FilterState,
+    skills: &'a [crate::services::skill::UnmanagedSkill],
+) -> Vec<&'a crate::services::skill::UnmanagedSkill> {
+    let query = filter.query_lower();
+    skills
+        .iter()
+        .filter(|skill| match &query {
+            None => true,
+            Some(q) => {
+                skill.name.to_lowercase().contains(q)
+                    || skill.directory.to_lowercase().contains(q)
+                    || skill
+                        .description
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_lowercase()
+                        .contains(q)
+                    || skill.found_in.iter().any(|s| s.to_lowercase().contains(q))
             }
         })
         .collect()
@@ -1708,26 +2647,19 @@ fn app_type_for_picker_index(index: usize) -> AppType {
     }
 }
 
-fn should_hide_provider_field(key: &str) -> bool {
-    matches!(key, "createdAt" | "updatedAt" | "inFailoverQueue")
+fn sync_method_picker_index(method: SyncMethod) -> usize {
+    match method {
+        SyncMethod::Auto => 0,
+        SyncMethod::Symlink => 1,
+        SyncMethod::Copy => 2,
+    }
 }
 
-fn strip_provider_internal_fields(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let mut out = serde_json::Map::new();
-            for (k, v) in map {
-                if should_hide_provider_field(k) {
-                    continue;
-                }
-                out.insert(k.clone(), strip_provider_internal_fields(v));
-            }
-            Value::Object(out)
-        }
-        Value::Array(items) => {
-            Value::Array(items.iter().map(strip_provider_internal_fields).collect())
-        }
-        other => other.clone(),
+fn sync_method_for_picker_index(index: usize) -> SyncMethod {
+    match index {
+        1 => SyncMethod::Symlink,
+        2 => SyncMethod::Copy,
+        _ => SyncMethod::Auto,
     }
 }
 
@@ -1747,6 +2679,59 @@ mod tests {
 
     fn data() -> UiData {
         UiData::default()
+    }
+
+    #[test]
+    fn nav_menu_includes_skills_entry() {
+        assert!(
+            NavItem::ALL
+                .iter()
+                .any(|item| matches!(item, NavItem::Skills)),
+            "Ratatui TUI nav should include a Skills entry"
+        );
+        assert!(matches!(
+            NavItem::ALL[NavItem::ALL.len() - 1],
+            NavItem::Exit
+        ));
+    }
+
+    #[test]
+    fn skills_nav_item_routes_to_skills_page() {
+        assert_eq!(
+            NavItem::Skills.to_route(),
+            Some(Route::Skills),
+            "Skills nav item should route to the Skills page"
+        );
+    }
+
+    #[test]
+    fn skills_f_does_nothing_when_discover_is_disabled() {
+        let mut app = App::new(Some(AppType::Claude));
+        app.route = Route::Skills;
+        app.focus = Focus::Content;
+
+        let action = app.on_key(key(KeyCode::Char('f')), &data());
+        assert!(
+            matches!(action, Action::None),
+            "Discover is disabled; f should do nothing on Skills page"
+        );
+        assert!(
+            matches!(&app.overlay, Overlay::None),
+            "Discover is disabled; overlay should stay closed"
+        );
+    }
+
+    #[test]
+    fn skills_i_opens_import_existing_page() {
+        let mut app = App::new(Some(AppType::Claude));
+        app.route = Route::Skills;
+        app.focus = Focus::Content;
+
+        let action = app.on_key(key(KeyCode::Char('i')), &data());
+        assert!(
+            matches!(action, Action::SwitchRoute(Route::SkillsUnmanaged)),
+            "i in Skills page should navigate to Import Existing"
+        );
     }
 
     #[test]
@@ -1817,17 +2802,36 @@ mod tests {
         let original = json!({
             "id": "p1",
             "name": "demo",
+            "meta": {
+                "applyCommonConfig": true,
+                "custom_endpoints": {
+                    "https://example.com": {
+                        "url": "https://example.com"
+                    }
+                }
+            },
+            "icon": "openai",
+            "iconColor": "#00A67E",
             "settingsConfig": {
                 "env": {
                     "ANTHROPIC_AUTH_TOKEN": "secret-token",
                     "FOO": "bar"
                 }
             },
-            "createdAt": 123
+            "createdAt": 123,
+            "sortIndex": 9,
+            "category": "demo",
+            "inFailoverQueue": true
         });
 
-        let display = strip_provider_internal_fields(&original);
+        let display = super::super::form::strip_provider_internal_fields(&original);
         assert!(display.get("createdAt").is_none());
+        assert!(display.get("meta").is_none());
+        assert!(display.get("icon").is_none());
+        assert!(display.get("iconColor").is_none());
+        assert!(display.get("sortIndex").is_none());
+        assert!(display.get("category").is_none());
+        assert!(display.get("inFailoverQueue").is_none());
         assert_eq!(
             display["settingsConfig"]["env"]["ANTHROPIC_AUTH_TOKEN"],
             "secret-token"
@@ -1943,7 +2947,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_a_opens_add_editor() {
+    fn mcp_a_opens_add_form() {
         let mut app = App::new(Some(AppType::Claude));
         app.route = Route::Mcp;
         app.focus = Focus::Content;
@@ -1951,10 +2955,10 @@ mod tests {
         let data = UiData::default();
         let action = app.on_key(key(KeyCode::Char('a')), &data);
         assert!(matches!(action, Action::None));
-        assert!(matches!(
-            app.editor.as_ref().map(|e| &e.submit),
-            Some(EditorSubmit::McpAdd)
-        ));
+        assert!(
+            app.editor.is_none(),
+            "MCP 'a' should open the new add form (not the JSON editor)"
+        );
     }
 
     #[test]
@@ -2029,7 +3033,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_e_opens_edit_editor() {
+    fn mcp_e_opens_edit_form() {
         let mut app = App::new(Some(AppType::Claude));
         app.route = Route::Mcp;
         app.focus = Focus::Content;
@@ -2051,10 +3055,8 @@ mod tests {
 
         let action = app.on_key(key(KeyCode::Char('e')), &data);
         assert!(matches!(action, Action::None));
-        assert!(matches!(
-            app.editor.as_ref().map(|e| &e.submit),
-            Some(EditorSubmit::McpEdit { id }) if id == "m1"
-        ));
+        assert!(app.editor.is_none());
+        assert!(app.form.is_some());
     }
 
     #[test]
@@ -2182,7 +3184,7 @@ mod tests {
     }
 
     #[test]
-    fn providers_e_opens_editor_and_ctrl_s_submits() {
+    fn providers_e_opens_edit_form_and_ctrl_s_submits() {
         let mut app = App::new(Some(AppType::Claude));
         app.route = Route::Providers;
         app.focus = Focus::Content;
@@ -2202,10 +3204,8 @@ mod tests {
 
         let action = app.on_key(key(KeyCode::Char('e')), &data);
         assert!(matches!(action, Action::None));
-        assert!(matches!(
-            app.editor.as_ref().map(|e| &e.submit),
-            Some(EditorSubmit::ProviderEdit { id }) if id == "p1"
-        ));
+        assert!(app.editor.is_none());
+        assert!(app.form.is_some());
 
         let submit = app.on_key(ctrl(KeyCode::Char('s')), &data);
         assert!(matches!(
@@ -2218,7 +3218,49 @@ mod tests {
     }
 
     #[test]
-    fn providers_a_opens_add_editor() {
+    fn provider_edit_form_tab_cycles_between_fields_and_json() {
+        let mut app = App::new(Some(AppType::Claude));
+        app.route = Route::Providers;
+        app.focus = Focus::Content;
+
+        let mut data = UiData::default();
+        data.providers.rows.push(super::super::data::ProviderRow {
+            id: "p1".to_string(),
+            provider: crate::provider::Provider::with_id(
+                "p1".to_string(),
+                "Provider One".to_string(),
+                json!({"env":{"ANTHROPIC_BASE_URL":"https://example.com"}}),
+                None,
+            ),
+            api_url: Some("https://example.com".to_string()),
+            is_current: false,
+        });
+
+        app.on_key(key(KeyCode::Char('e')), &data);
+
+        let focus = match app.form.as_ref() {
+            Some(super::super::form::FormState::ProviderAdd(form)) => form.focus,
+            other => panic!("expected ProviderAdd form, got: {other:?}"),
+        };
+        assert_eq!(focus, super::super::form::FormFocus::Fields);
+
+        app.on_key(key(KeyCode::Tab), &data);
+        let focus = match app.form.as_ref() {
+            Some(super::super::form::FormState::ProviderAdd(form)) => form.focus,
+            other => panic!("expected ProviderAdd form, got: {other:?}"),
+        };
+        assert_eq!(focus, super::super::form::FormFocus::JsonPreview);
+
+        app.on_key(key(KeyCode::Tab), &data);
+        let focus = match app.form.as_ref() {
+            Some(super::super::form::FormState::ProviderAdd(form)) => form.focus,
+            other => panic!("expected ProviderAdd form, got: {other:?}"),
+        };
+        assert_eq!(focus, super::super::form::FormFocus::Fields);
+    }
+
+    #[test]
+    fn providers_a_opens_add_form() {
         let mut app = App::new(Some(AppType::Claude));
         app.route = Route::Providers;
         app.focus = Focus::Content;
@@ -2226,18 +3268,79 @@ mod tests {
         let data = UiData::default();
         let action = app.on_key(key(KeyCode::Char('a')), &data);
         assert!(matches!(action, Action::None));
-        assert!(matches!(
-            app.editor.as_ref().map(|e| &e.submit),
-            Some(EditorSubmit::ProviderAdd)
-        ));
+        assert!(
+            app.editor.is_none(),
+            "Providers 'a' should open the new add form (not the JSON editor)"
+        );
 
         let submit = app.on_key(ctrl(KeyCode::Char('s')), &data);
-        assert!(matches!(
-            submit,
-            Action::EditorSubmit {
-                submit: EditorSubmit::ProviderAdd,
-                ..
-            }
-        ));
+        assert!(
+            !matches!(submit, Action::EditorSubmit { .. }),
+            "Provider add form should validate fields before submitting"
+        );
+    }
+
+    #[test]
+    fn provider_add_form_tab_cycles_focus() {
+        let mut app = App::new(Some(AppType::Claude));
+        app.route = Route::Providers;
+        app.focus = Focus::Content;
+
+        let data = UiData::default();
+        app.on_key(key(KeyCode::Char('a')), &data);
+
+        let focus = match app.form.as_ref() {
+            Some(super::super::form::FormState::ProviderAdd(form)) => form.focus,
+            other => panic!("expected ProviderAdd form, got: {other:?}"),
+        };
+        assert_eq!(focus, super::super::form::FormFocus::Templates);
+
+        app.on_key(key(KeyCode::Tab), &data);
+        let focus = match app.form.as_ref() {
+            Some(super::super::form::FormState::ProviderAdd(form)) => form.focus,
+            other => panic!("expected ProviderAdd form, got: {other:?}"),
+        };
+        assert_eq!(focus, super::super::form::FormFocus::Fields);
+    }
+
+    #[test]
+    fn provider_add_form_right_moves_template_selection() {
+        let mut app = App::new(Some(AppType::Claude));
+        app.route = Route::Providers;
+        app.focus = Focus::Content;
+
+        let data = UiData::default();
+        app.on_key(key(KeyCode::Char('a')), &data);
+
+        let idx = match app.form.as_ref() {
+            Some(super::super::form::FormState::ProviderAdd(form)) => form.template_idx,
+            other => panic!("expected ProviderAdd form, got: {other:?}"),
+        };
+        assert_eq!(idx, 0);
+
+        app.on_key(key(KeyCode::Right), &data);
+        let idx = match app.form.as_ref() {
+            Some(super::super::form::FormState::ProviderAdd(form)) => form.template_idx,
+            other => panic!("expected ProviderAdd form, got: {other:?}"),
+        };
+        assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn provider_add_form_enter_applies_template_and_focuses_fields() {
+        let mut app = App::new(Some(AppType::Claude));
+        app.route = Route::Providers;
+        app.focus = Focus::Content;
+
+        let data = UiData::default();
+        app.on_key(key(KeyCode::Char('a')), &data);
+        let action = app.on_key(key(KeyCode::Enter), &data);
+        assert!(matches!(action, Action::None));
+        assert!(app.editor.is_none());
+        let focus = match app.form.as_ref() {
+            Some(super::super::form::FormState::ProviderAdd(form)) => form.focus,
+            other => panic!("expected ProviderAdd form, got: {other:?}"),
+        };
+        assert_eq!(focus, super::super::form::FormFocus::Fields);
     }
 }

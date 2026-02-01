@@ -6,6 +6,11 @@ pub enum Route {
     Mcp,
     Prompts,
     Config,
+    Skills,
+    SkillsDiscover,
+    SkillsRepos,
+    SkillsUnmanaged,
+    SkillDetail { directory: String },
     Settings,
 }
 
@@ -16,17 +21,19 @@ pub enum NavItem {
     Mcp,
     Prompts,
     Config,
+    Skills,
     Settings,
     Exit,
 }
 
 impl NavItem {
-    pub const ALL: [NavItem; 7] = [
+    pub const ALL: [NavItem; 8] = [
         NavItem::Main,
         NavItem::Providers,
         NavItem::Mcp,
         NavItem::Prompts,
         NavItem::Config,
+        NavItem::Skills,
         NavItem::Settings,
         NavItem::Exit,
     ];
@@ -38,6 +45,7 @@ impl NavItem {
             NavItem::Mcp => Some(Route::Mcp),
             NavItem::Prompts => Some(Route::Prompts),
             NavItem::Config => Some(Route::Config),
+            NavItem::Skills => Some(Route::Skills),
             NavItem::Settings => Some(Route::Settings),
             NavItem::Exit => None,
         }

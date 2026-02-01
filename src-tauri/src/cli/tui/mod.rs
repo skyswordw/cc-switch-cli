@@ -1,5 +1,6 @@
 mod app;
 mod data;
+mod form;
 mod route;
 mod terminal;
 mod theme;
@@ -16,7 +17,10 @@ use crate::app_config::{AppType, MultiAppConfig};
 use crate::cli::i18n::{set_language, texts};
 use crate::error::AppError;
 use crate::provider::Provider;
-use crate::services::{ConfigService, EndpointLatency, McpService, PromptService, ProviderService};
+use crate::services::{
+    skill::SkillRepo, ConfigService, EndpointLatency, McpService, PromptService, ProviderService,
+    SkillService,
+};
 
 use app::{Action, App, EditorSubmit, Overlay, TextViewState, ToastKind};
 use data::{load_state, UiData};
@@ -33,9 +37,31 @@ enum SpeedtestMsg {
     },
 }
 
+enum SkillsReq {
+    Discover { query: String },
+    Install { spec: String, app: AppType },
+}
+
+enum SkillsMsg {
+    DiscoverFinished {
+        query: String,
+        result: Result<Vec<crate::services::skill::Skill>, String>,
+    },
+    InstallFinished {
+        spec: String,
+        result: Result<crate::services::skill::InstalledSkill, String>,
+    },
+}
+
 struct SpeedtestSystem {
     req_tx: mpsc::Sender<String>,
     result_rx: mpsc::Receiver<SpeedtestMsg>,
+    _handle: std::thread::JoinHandle<()>,
+}
+
+struct SkillsSystem {
+    req_tx: mpsc::Sender<SkillsReq>,
+    result_rx: mpsc::Receiver<SkillsMsg>,
     _handle: std::thread::JoinHandle<()>,
 }
 
@@ -59,6 +85,17 @@ pub fn run(app_override: Option<AppType>) -> Result<(), AppError> {
         }
     };
 
+    let skills = match start_skills_system() {
+        Ok(system) => Some(system),
+        Err(err) => {
+            app.push_toast(
+                texts::tui_toast_skills_worker_unavailable(&err.to_string()),
+                ToastKind::Warning,
+            );
+            None
+        }
+    };
+
     loop {
         app.last_size = terminal.size()?;
         terminal.draw(|f| ui::render(f, &app, &data))?;
@@ -67,6 +104,15 @@ pub fn run(app_override: Option<AppType>) -> Result<(), AppError> {
         if let Some(speedtest) = speedtest.as_ref() {
             while let Ok(msg) = speedtest.result_rx.try_recv() {
                 handle_speedtest_msg(&mut app, msg);
+            }
+        }
+
+        // Handle async Skills results (non-blocking).
+        if let Some(skills) = skills.as_ref() {
+            while let Ok(msg) = skills.result_rx.try_recv() {
+                if let Err(err) = handle_skills_msg(&mut app, &mut data, msg) {
+                    app.push_toast(err.to_string(), ToastKind::Error);
+                }
             }
         }
 
@@ -80,6 +126,7 @@ pub fn run(app_override: Option<AppType>) -> Result<(), AppError> {
                         &mut app,
                         &mut data,
                         speedtest.as_ref().map(|s| &s.req_tx),
+                        skills.as_ref().map(|s| &s.req_tx),
                         action,
                     ) {
                         if matches!(
@@ -157,11 +204,64 @@ fn handle_speedtest_msg(app: &mut App, msg: SpeedtestMsg) {
     }
 }
 
+fn handle_skills_msg(app: &mut App, data: &mut UiData, msg: SkillsMsg) -> Result<(), AppError> {
+    match msg {
+        SkillsMsg::DiscoverFinished { query, result } => match result {
+            Ok(skills) => {
+                app.overlay = Overlay::None;
+                app.skills_discover_results = skills;
+                app.skills_discover_idx = 0;
+                app.skills_discover_query = query.clone();
+                app.push_toast(
+                    texts::tui_toast_skills_discover_finished(app.skills_discover_results.len()),
+                    ToastKind::Success,
+                );
+            }
+            Err(err) => {
+                app.overlay = Overlay::None;
+                app.push_toast(
+                    texts::tui_toast_skills_discover_failed(&err),
+                    ToastKind::Error,
+                );
+            }
+        },
+        SkillsMsg::InstallFinished { spec, result } => match result {
+            Ok(installed) => {
+                app.overlay = Overlay::None;
+                // Refresh local snapshots.
+                *data = UiData::load(&app.app_type)?;
+
+                // Mark discover result row as installed (best-effort).
+                for row in app.skills_discover_results.iter_mut() {
+                    if row.directory.eq_ignore_ascii_case(&installed.directory) {
+                        row.installed = true;
+                    }
+                }
+
+                app.push_toast(
+                    texts::tui_toast_skill_installed(&installed.directory),
+                    ToastKind::Success,
+                );
+            }
+            Err(err) => {
+                app.overlay = Overlay::None;
+                app.push_toast(
+                    texts::tui_toast_skill_install_failed(&spec, &err),
+                    ToastKind::Error,
+                );
+            }
+        },
+    }
+
+    Ok(())
+}
+
 fn handle_action(
     _terminal: &mut TuiTerminal,
     app: &mut App,
     data: &mut UiData,
     speedtest_req_tx: Option<&mpsc::Sender<String>>,
+    skills_req_tx: Option<&mpsc::Sender<SkillsReq>>,
     action: Action,
 ) -> Result<(), AppError> {
     match action {
@@ -178,10 +278,141 @@ fn handle_action(
         }
         Action::SwitchRoute(route) => {
             app.route = route;
+            if matches!(app.route, crate::cli::tui::route::Route::SkillsUnmanaged) {
+                app.skills_unmanaged_results = SkillService::scan_unmanaged()?;
+                app.skills_unmanaged_selected.clear();
+                app.skills_unmanaged_idx = 0;
+            }
             Ok(())
         }
         Action::Quit => {
             app.should_quit = true;
+            Ok(())
+        }
+        Action::SkillsToggle { directory, enabled } => {
+            SkillService::toggle_app(&directory, &app.app_type, enabled)?;
+            *data = UiData::load(&app.app_type)?;
+            app.push_toast(
+                texts::tui_toast_skill_toggled(&directory, enabled),
+                ToastKind::Success,
+            );
+            Ok(())
+        }
+        Action::SkillsInstall { spec } => {
+            let Some(tx) = skills_req_tx else {
+                return Err(AppError::Message(
+                    texts::tui_error_skills_worker_unavailable().to_string(),
+                ));
+            };
+            app.overlay = Overlay::Loading {
+                title: texts::tui_skills_install_title().to_string(),
+                message: texts::tui_loading().to_string(),
+            };
+            tx.send(SkillsReq::Install {
+                spec: spec.clone(),
+                app: app.app_type.clone(),
+            })
+            .map_err(|e| AppError::Message(e.to_string()))?;
+            Ok(())
+        }
+        Action::SkillsUninstall { directory } => {
+            SkillService::uninstall(&directory)?;
+            *data = UiData::load(&app.app_type)?;
+            app.push_toast(
+                texts::tui_toast_skill_uninstalled(&directory),
+                ToastKind::Success,
+            );
+            if matches!(
+                &app.route,
+                crate::cli::tui::route::Route::SkillDetail { directory: current }
+                    if current.eq_ignore_ascii_case(&directory)
+            ) {
+                app.route = crate::cli::tui::route::Route::Skills;
+            }
+            Ok(())
+        }
+        Action::SkillsSync { app: scope } => {
+            let scope_ref = scope.as_ref();
+            SkillService::sync_all_enabled(scope_ref)?;
+            *data = UiData::load(&app.app_type)?;
+            app.push_toast(texts::tui_toast_skills_synced(), ToastKind::Success);
+            Ok(())
+        }
+        Action::SkillsSetSyncMethod { method } => {
+            SkillService::set_sync_method(method)?;
+            *data = UiData::load(&app.app_type)?;
+            app.push_toast(
+                texts::tui_toast_skills_sync_method_set(texts::tui_skills_sync_method_name(method)),
+                ToastKind::Success,
+            );
+            Ok(())
+        }
+        Action::SkillsDiscover { query } => {
+            let Some(tx) = skills_req_tx else {
+                return Err(AppError::Message(
+                    texts::tui_error_skills_worker_unavailable().to_string(),
+                ));
+            };
+            app.overlay = Overlay::Loading {
+                title: texts::tui_skills_discover_title().to_string(),
+                message: texts::tui_loading().to_string(),
+            };
+            tx.send(SkillsReq::Discover { query })
+                .map_err(|e| AppError::Message(e.to_string()))?;
+            Ok(())
+        }
+        Action::SkillsRepoAdd { spec } => {
+            let repo = parse_repo_spec(&spec)?;
+            SkillService::upsert_repo(repo)?;
+            *data = UiData::load(&app.app_type)?;
+            app.push_toast(texts::tui_toast_repo_added(), ToastKind::Success);
+            Ok(())
+        }
+        Action::SkillsRepoRemove { owner, name } => {
+            SkillService::remove_repo(&owner, &name)?;
+            *data = UiData::load(&app.app_type)?;
+            app.push_toast(texts::tui_toast_repo_removed(), ToastKind::Success);
+            Ok(())
+        }
+        Action::SkillsRepoToggleEnabled {
+            owner,
+            name,
+            enabled,
+        } => {
+            let mut index = SkillService::load_index()?;
+            if let Some(repo) = index
+                .repos
+                .iter_mut()
+                .find(|r| r.owner == owner && r.name == name)
+            {
+                repo.enabled = enabled;
+                SkillService::save_index(&index)?;
+            }
+            *data = UiData::load(&app.app_type)?;
+            app.push_toast(texts::tui_toast_repo_toggled(enabled), ToastKind::Success);
+            Ok(())
+        }
+        Action::SkillsScanUnmanaged => {
+            app.skills_unmanaged_results = SkillService::scan_unmanaged()?;
+            app.skills_unmanaged_selected.clear();
+            app.skills_unmanaged_idx = 0;
+            app.push_toast(
+                texts::tui_toast_unmanaged_scanned(app.skills_unmanaged_results.len()),
+                ToastKind::Success,
+            );
+            Ok(())
+        }
+        Action::SkillsImportFromApps { directories } => {
+            let imported = SkillService::import_from_apps(directories)?;
+            *data = UiData::load(&app.app_type)?;
+            // Refresh unmanaged list after import.
+            app.skills_unmanaged_results = SkillService::scan_unmanaged()?;
+            app.skills_unmanaged_selected.clear();
+            app.skills_unmanaged_idx = 0;
+            app.push_toast(
+                texts::tui_toast_unmanaged_imported(imported.len()),
+                ToastKind::Success,
+            );
             Ok(())
         }
         Action::EditorDiscard => {
@@ -240,6 +471,7 @@ fn handle_action(
                 match ProviderService::add(&state, app.app_type.clone(), provider) {
                     Ok(true) => {
                         app.editor = None;
+                        app.form = None;
                         app.push_toast(
                             texts::tui_toast_provider_add_finished(),
                             ToastKind::Success,
@@ -281,6 +513,7 @@ fn handle_action(
                 }
 
                 app.editor = None;
+                app.form = None;
                 app.push_toast(
                     texts::tui_toast_provider_edit_finished(),
                     ToastKind::Success,
@@ -312,6 +545,7 @@ fn handle_action(
                 }
 
                 app.editor = None;
+                app.form = None;
                 app.push_toast(texts::tui_toast_mcp_upserted(), ToastKind::Success);
                 *data = UiData::load(&app.app_type)?;
                 Ok(())
@@ -342,6 +576,7 @@ fn handle_action(
                 }
 
                 app.editor = None;
+                app.form = None;
                 app.push_toast(texts::tui_toast_mcp_upserted(), ToastKind::Success);
                 *data = UiData::load(&app.app_type)?;
                 Ok(())
@@ -844,6 +1079,147 @@ fn speedtest_worker_loop(rx: mpsc::Receiver<String>, tx: mpsc::Sender<SpeedtestM
 
         let _ = tx.send(SpeedtestMsg::Finished { url, result });
     }
+}
+
+fn start_skills_system() -> Result<SkillsSystem, AppError> {
+    let (result_tx, result_rx) = mpsc::channel::<SkillsMsg>();
+    let (req_tx, req_rx) = mpsc::channel::<SkillsReq>();
+
+    let handle = std::thread::Builder::new()
+        .name("cc-switch-skills".to_string())
+        .spawn(move || skills_worker_loop(req_rx, result_tx))
+        .map_err(|e| AppError::IoContext {
+            context: "failed to spawn skills worker thread".to_string(),
+            source: e,
+        })?;
+
+    Ok(SkillsSystem {
+        req_tx,
+        result_rx,
+        _handle: handle,
+    })
+}
+
+fn skills_worker_loop(rx: mpsc::Receiver<SkillsReq>, tx: mpsc::Sender<SkillsMsg>) {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            let err = e.to_string();
+            while let Ok(req) = rx.recv() {
+                match req {
+                    SkillsReq::Discover { query } => {
+                        let _ = tx.send(SkillsMsg::DiscoverFinished {
+                            query,
+                            result: Err(err.clone()),
+                        });
+                    }
+                    SkillsReq::Install { spec, .. } => {
+                        let _ = tx.send(SkillsMsg::InstallFinished {
+                            spec,
+                            result: Err(err.clone()),
+                        });
+                    }
+                }
+            }
+            return;
+        }
+    };
+
+    let service = match SkillService::new() {
+        Ok(service) => service,
+        Err(e) => {
+            let err = e.to_string();
+            while let Ok(req) = rx.recv() {
+                match req {
+                    SkillsReq::Discover { query } => {
+                        let _ = tx.send(SkillsMsg::DiscoverFinished {
+                            query,
+                            result: Err(err.clone()),
+                        });
+                    }
+                    SkillsReq::Install { spec, .. } => {
+                        let _ = tx.send(SkillsMsg::InstallFinished {
+                            spec,
+                            result: Err(err.clone()),
+                        });
+                    }
+                }
+            }
+            return;
+        }
+    };
+
+    while let Ok(req) = rx.recv() {
+        match req {
+            SkillsReq::Discover { query } => {
+                let query_trimmed = query.trim().to_lowercase();
+                let result = rt
+                    .block_on(async { service.list_skills().await })
+                    .map_err(|e| e.to_string())
+                    .map(|mut skills| {
+                        if !query_trimmed.is_empty() {
+                            skills.retain(|s| {
+                                s.name.to_lowercase().contains(&query_trimmed)
+                                    || s.directory.to_lowercase().contains(&query_trimmed)
+                                    || s.description.to_lowercase().contains(&query_trimmed)
+                                    || s.key.to_lowercase().contains(&query_trimmed)
+                            });
+                        }
+                        skills
+                    });
+
+                let _ = tx.send(SkillsMsg::DiscoverFinished { query, result });
+            }
+            SkillsReq::Install { spec, app } => {
+                let spec_clone = spec.clone();
+                let app_clone = app.clone();
+                let result = rt
+                    .block_on(async { service.install(&spec_clone, &app_clone).await })
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(SkillsMsg::InstallFinished { spec, result });
+            }
+        }
+    }
+}
+
+fn parse_repo_spec(raw: &str) -> Result<SkillRepo, AppError> {
+    let raw = raw.trim().trim_end_matches('/');
+    if raw.is_empty() {
+        return Err(AppError::InvalidInput(
+            texts::tui_error_repo_spec_empty().to_string(),
+        ));
+    }
+
+    // Allow: https://github.com/owner/name or owner/name[@branch]
+    let without_prefix = raw
+        .strip_prefix("https://github.com/")
+        .or_else(|| raw.strip_prefix("http://github.com/"))
+        .unwrap_or(raw);
+
+    let without_git = without_prefix.trim_end_matches(".git");
+
+    let (path, branch) = if let Some((left, right)) = without_git.rsplit_once('@') {
+        (left, Some(right))
+    } else {
+        (without_git, None)
+    };
+
+    let Some((owner, name)) = path.split_once('/') else {
+        return Err(AppError::InvalidInput(
+            texts::tui_error_repo_spec_invalid().to_string(),
+        ));
+    };
+
+    Ok(SkillRepo {
+        owner: owner.to_string(),
+        name: name.to_string(),
+        branch: branch.unwrap_or("main").to_string(),
+        enabled: true,
+        skills_path: None,
+    })
 }
 
 #[cfg(test)]

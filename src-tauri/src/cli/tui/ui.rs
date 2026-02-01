@@ -8,7 +8,7 @@ use ratatui::{
     },
     Frame,
 };
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app_config::AppType;
 use crate::cli::i18n::texts;
@@ -16,6 +16,7 @@ use crate::cli::i18n::texts;
 use super::{
     app::{App, ConfigItem, EditorMode, Focus, Overlay, ToastKind},
     data::{McpRow, ProviderRow, UiData},
+    form::{FormFocus, FormState, GeminiAuthType, McpAddField, ProviderAddField},
     route::{NavItem, Route},
     theme::theme_for,
 };
@@ -309,8 +310,13 @@ fn render_header(
     );
     let badge_content = format!("  {}  ", provider_text);
     let badge_width = (UnicodeWidthStr::width(badge_content.as_str()) as u16).min(chunks[2].width);
+    let right_padding = 1u16;
     let badge_area = Rect {
-        x: chunks[2].x + chunks[2].width.saturating_sub(badge_width),
+        x: chunks[2].x.saturating_add(
+            chunks[2]
+                .width
+                .saturating_sub(badge_width.saturating_add(right_padding)),
+        ),
         y: chunks[2].y,
         width: badge_width,
         height: 1,
@@ -341,6 +347,7 @@ fn nav_label(item: NavItem) -> &'static str {
         NavItem::Mcp => texts::menu_manage_mcp(),
         NavItem::Prompts => texts::menu_manage_prompts(),
         NavItem::Config => texts::menu_manage_config(),
+        NavItem::Skills => texts::menu_manage_skills(),
         NavItem::Settings => texts::menu_settings(),
         NavItem::Exit => texts::menu_exit(),
     }
@@ -394,6 +401,11 @@ fn render_content(
         return;
     }
 
+    if let Some(form) = &app.form {
+        render_add_form(frame, app, data, form, content_area, theme);
+        return;
+    }
+
     match &app.route {
         Route::Main => render_main(frame, app, data, content_area, theme),
         Route::Providers => render_providers(frame, app, data, content_area, theme),
@@ -403,8 +415,648 @@ fn render_content(
         Route::Mcp => render_mcp(frame, app, data, content_area, theme),
         Route::Prompts => render_prompts(frame, app, data, content_area, theme),
         Route::Config => render_config(frame, app, data, content_area, theme),
+        Route::Skills => render_skills_installed(frame, app, data, content_area, theme),
+        Route::SkillsDiscover => render_skills_discover(frame, app, data, content_area, theme),
+        Route::SkillsRepos => render_skills_repos(frame, app, data, content_area, theme),
+        Route::SkillsUnmanaged => render_skills_unmanaged(frame, app, data, content_area, theme),
+        Route::SkillDetail { directory } => {
+            render_skill_detail(frame, app, data, content_area, theme, directory)
+        }
         Route::Settings => render_settings(frame, app, content_area, theme),
     }
+}
+
+fn skills_installed_filtered<'a>(
+    app: &App,
+    data: &'a UiData,
+) -> Vec<&'a crate::services::skill::InstalledSkill> {
+    let query = app.filter.query_lower();
+    data.skills
+        .installed
+        .iter()
+        .filter(|skill| match &query {
+            None => true,
+            Some(q) => {
+                skill.name.to_lowercase().contains(q)
+                    || skill.directory.to_lowercase().contains(q)
+                    || skill.id.to_lowercase().contains(q)
+            }
+        })
+        .collect()
+}
+
+fn render_skills_installed(
+    frame: &mut Frame<'_>,
+    app: &App,
+    data: &UiData,
+    area: Rect,
+    theme: &super::theme::Theme,
+) {
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(pane_border_style(app, Focus::Content, theme))
+        .title(texts::skills_management());
+    frame.render_widget(outer.clone(), area);
+    let inner = outer.inner(area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+
+    if app.focus == Focus::Content {
+        render_key_bar_center(
+            frame,
+            chunks[0],
+            theme,
+            &[
+                ("Enter", texts::tui_key_details()),
+                ("x", texts::tui_key_toggle()),
+                ("i", texts::tui_skills_action_import_existing()),
+            ],
+        );
+    }
+
+    let enabled_claude = data
+        .skills
+        .installed
+        .iter()
+        .filter(|s| s.apps.claude)
+        .count();
+    let enabled_codex = data
+        .skills
+        .installed
+        .iter()
+        .filter(|s| s.apps.codex)
+        .count();
+    let enabled_gemini = data
+        .skills
+        .installed
+        .iter()
+        .filter(|s| s.apps.gemini)
+        .count();
+    let summary = texts::tui_skills_installed_counts(enabled_claude, enabled_codex, enabled_gemini);
+
+    let summary_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(theme.dim));
+    frame.render_widget(
+        Paragraph::new(Line::raw(format!("  {summary}")))
+            .style(Style::default().fg(theme.dim))
+            .wrap(Wrap { trim: false })
+            .block(summary_block),
+        chunks[1],
+    );
+
+    let visible = skills_installed_filtered(app, data);
+    if visible.is_empty() {
+        let empty_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(0),
+                Constraint::Length(7),
+                Constraint::Min(0),
+            ])
+            .split(chunks[2]);
+
+        let icon_style = if theme.no_color {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD)
+        };
+
+        let empty_lines = vec![
+            Line::raw(""),
+            Line::from(Span::styled("✦", icon_style)),
+            Line::raw(""),
+            Line::from(Span::styled(
+                texts::tui_skills_empty_title(),
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::raw(""),
+            Line::from(Span::styled(
+                texts::tui_skills_empty_subtitle(),
+                Style::default().fg(theme.dim),
+            )),
+        ];
+
+        frame.render_widget(
+            Paragraph::new(empty_lines)
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: false }),
+            empty_chunks[1],
+        );
+        return;
+    }
+
+    let header_style = Style::default().fg(theme.dim).add_modifier(Modifier::BOLD);
+    let header = Row::new(vec![
+        Cell::from(texts::tui_header_directory()),
+        Cell::from(texts::header_name()),
+        Cell::from(texts::tui_header_claude_short()),
+        Cell::from(texts::tui_header_codex_short()),
+        Cell::from(texts::tui_header_gemini_short()),
+    ])
+    .style(header_style);
+
+    let rows = visible.iter().map(|skill| {
+        Row::new(vec![
+            Cell::from(skill.directory.clone()),
+            Cell::from(skill.name.clone()),
+            Cell::from(if skill.apps.claude { "✓" } else { " " }),
+            Cell::from(if skill.apps.codex { "✓" } else { " " }),
+            Cell::from(if skill.apps.gemini { "✓" } else { " " }),
+        ])
+    });
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Percentage(55),
+            Constraint::Percentage(35),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+        ],
+    )
+    .header(header)
+    .block(Block::default().borders(Borders::NONE))
+    .row_highlight_style(selection_style(theme))
+    .highlight_symbol(highlight_symbol(theme));
+
+    let mut state = TableState::default();
+    state.select(Some(app.skills_idx));
+    frame.render_stateful_widget(table, inset_left(chunks[2], 2), &mut state);
+}
+
+fn render_skills_discover(
+    frame: &mut Frame<'_>,
+    app: &App,
+    _data: &UiData,
+    area: Rect,
+    theme: &super::theme::Theme,
+) {
+    let title = format!(
+        "{} — {}",
+        texts::tui_skills_discover_title(),
+        if app.skills_discover_query.trim().is_empty() {
+            texts::tui_skills_discover_query_empty()
+        } else {
+            app.skills_discover_query.as_str()
+        }
+    );
+
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(pane_border_style(app, Focus::Content, theme))
+        .title(title);
+    frame.render_widget(outer.clone(), area);
+    let inner = outer.inner(area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(0)])
+        .split(inner);
+
+    if app.focus == Focus::Content {
+        render_key_bar_center(
+            frame,
+            chunks[0],
+            theme,
+            &[
+                ("Enter", texts::tui_key_install()),
+                ("f", texts::tui_key_search()),
+            ],
+        );
+    }
+
+    let query = app.filter.query_lower();
+    let visible = app
+        .skills_discover_results
+        .iter()
+        .filter(|skill| match &query {
+            None => true,
+            Some(q) => {
+                skill.name.to_lowercase().contains(q)
+                    || skill.directory.to_lowercase().contains(q)
+                    || skill.key.to_lowercase().contains(q)
+                    || skill.description.to_lowercase().contains(q)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if visible.is_empty() {
+        frame.render_widget(
+            Paragraph::new(texts::tui_skills_discover_hint())
+                .style(Style::default().fg(theme.dim))
+                .wrap(Wrap { trim: false }),
+            inset_left(chunks[1], 2),
+        );
+        return;
+    }
+
+    let header_style = Style::default().fg(theme.dim).add_modifier(Modifier::BOLD);
+    let header = Row::new(vec![
+        Cell::from(""),
+        Cell::from(texts::tui_header_directory()),
+        Cell::from(texts::header_name()),
+        Cell::from(texts::tui_header_repo()),
+    ])
+    .style(header_style);
+
+    let rows = visible.iter().map(|skill| {
+        let repo = match (&skill.repo_owner, &skill.repo_name) {
+            (Some(owner), Some(name)) => format!("{owner}/{name}"),
+            _ => "-".to_string(),
+        };
+        Row::new(vec![
+            Cell::from(if skill.installed { "✓" } else { " " }),
+            Cell::from(skill.directory.clone()),
+            Cell::from(skill.name.clone()),
+            Cell::from(repo),
+        ])
+    });
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(2),
+            Constraint::Percentage(35),
+            Constraint::Percentage(40),
+            Constraint::Percentage(25),
+        ],
+    )
+    .header(header)
+    .block(Block::default().borders(Borders::NONE))
+    .row_highlight_style(selection_style(theme))
+    .highlight_symbol(highlight_symbol(theme));
+
+    let mut state = TableState::default();
+    state.select(Some(app.skills_discover_idx));
+    frame.render_stateful_widget(table, inset_left(chunks[1], 2), &mut state);
+}
+
+fn render_skills_repos(
+    frame: &mut Frame<'_>,
+    app: &App,
+    data: &UiData,
+    area: Rect,
+    theme: &super::theme::Theme,
+) {
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(pane_border_style(app, Focus::Content, theme))
+        .title(texts::tui_skills_repos_title());
+    frame.render_widget(outer.clone(), area);
+    let inner = outer.inner(area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+
+    if app.focus == Focus::Content {
+        render_key_bar_center(
+            frame,
+            chunks[0],
+            theme,
+            &[
+                ("a", texts::tui_key_add()),
+                ("d", texts::tui_key_delete()),
+                ("x", texts::tui_key_toggle()),
+            ],
+        );
+    }
+
+    frame.render_widget(
+        Paragraph::new(texts::tui_skills_repos_hint())
+            .style(Style::default().fg(theme.dim))
+            .wrap(Wrap { trim: false }),
+        inset_left(chunks[1], 1),
+    );
+
+    let query = app.filter.query_lower();
+    let visible = data
+        .skills
+        .repos
+        .iter()
+        .filter(|repo| match &query {
+            None => true,
+            Some(q) => {
+                repo.owner.to_lowercase().contains(q)
+                    || repo.name.to_lowercase().contains(q)
+                    || repo.branch.to_lowercase().contains(q)
+                    || repo
+                        .skills_path
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_lowercase()
+                        .contains(q)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if visible.is_empty() {
+        frame.render_widget(
+            Paragraph::new(texts::tui_skills_repos_empty())
+                .style(Style::default().fg(theme.dim))
+                .wrap(Wrap { trim: false }),
+            inset_left(chunks[2], 2),
+        );
+        return;
+    }
+
+    let header_style = Style::default().fg(theme.dim).add_modifier(Modifier::BOLD);
+    let header = Row::new(vec![
+        Cell::from(""),
+        Cell::from(texts::tui_header_repo()),
+        Cell::from(texts::tui_header_branch()),
+        Cell::from(texts::tui_header_path()),
+    ])
+    .style(header_style);
+
+    let rows = visible.iter().map(|repo| {
+        let repo_name = format!("{}/{}", repo.owner, repo.name);
+        Row::new(vec![
+            Cell::from(if repo.enabled { "✓" } else { " " }),
+            Cell::from(repo_name),
+            Cell::from(repo.branch.clone()),
+            Cell::from(repo.skills_path.as_deref().unwrap_or("-")),
+        ])
+    });
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(2),
+            Constraint::Percentage(45),
+            Constraint::Percentage(20),
+            Constraint::Percentage(35),
+        ],
+    )
+    .header(header)
+    .block(Block::default().borders(Borders::NONE))
+    .row_highlight_style(selection_style(theme))
+    .highlight_symbol(highlight_symbol(theme));
+
+    let mut state = TableState::default();
+    state.select(Some(app.skills_repo_idx));
+    frame.render_stateful_widget(table, inset_left(chunks[2], 2), &mut state);
+}
+
+fn render_skills_unmanaged(
+    frame: &mut Frame<'_>,
+    app: &App,
+    _data: &UiData,
+    area: Rect,
+    theme: &super::theme::Theme,
+) {
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(pane_border_style(app, Focus::Content, theme))
+        .title(texts::tui_skills_unmanaged_title());
+    frame.render_widget(outer.clone(), area);
+    let inner = outer.inner(area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+
+    if app.focus == Focus::Content {
+        render_key_bar_center(
+            frame,
+            chunks[0],
+            theme,
+            &[
+                ("Space", texts::tui_key_select()),
+                ("i", texts::tui_key_import()),
+                ("r", texts::tui_key_refresh()),
+            ],
+        );
+    }
+
+    frame.render_widget(
+        Paragraph::new(texts::tui_skills_unmanaged_hint())
+            .style(Style::default().fg(theme.dim))
+            .wrap(Wrap { trim: false }),
+        inset_left(chunks[1], 1),
+    );
+
+    let query = app.filter.query_lower();
+    let visible = app
+        .skills_unmanaged_results
+        .iter()
+        .filter(|skill| match &query {
+            None => true,
+            Some(q) => {
+                skill.name.to_lowercase().contains(q)
+                    || skill.directory.to_lowercase().contains(q)
+                    || skill
+                        .description
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_lowercase()
+                        .contains(q)
+                    || skill.found_in.iter().any(|s| s.to_lowercase().contains(q))
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if visible.is_empty() {
+        frame.render_widget(
+            Paragraph::new(texts::tui_skills_unmanaged_empty())
+                .style(Style::default().fg(theme.dim))
+                .wrap(Wrap { trim: false }),
+            inset_left(chunks[2], 2),
+        );
+        return;
+    }
+
+    let header_style = Style::default().fg(theme.dim).add_modifier(Modifier::BOLD);
+    let header = Row::new(vec![
+        Cell::from(""),
+        Cell::from(texts::tui_header_directory()),
+        Cell::from(texts::header_name()),
+        Cell::from(texts::tui_header_found_in()),
+    ])
+    .style(header_style);
+
+    let rows = visible.iter().map(|skill| {
+        Row::new(vec![
+            Cell::from(
+                if app.skills_unmanaged_selected.contains(&skill.directory) {
+                    "✓"
+                } else {
+                    " "
+                },
+            ),
+            Cell::from(skill.directory.clone()),
+            Cell::from(skill.name.clone()),
+            Cell::from(skill.found_in.join(", ")),
+        ])
+    });
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(2),
+            Constraint::Percentage(45),
+            Constraint::Percentage(35),
+            Constraint::Percentage(20),
+        ],
+    )
+    .header(header)
+    .block(Block::default().borders(Borders::NONE))
+    .row_highlight_style(selection_style(theme))
+    .highlight_symbol(highlight_symbol(theme));
+
+    let mut state = TableState::default();
+    state.select(Some(app.skills_unmanaged_idx));
+    frame.render_stateful_widget(table, inset_left(chunks[2], 2), &mut state);
+}
+
+fn render_skill_detail(
+    frame: &mut Frame<'_>,
+    app: &App,
+    data: &UiData,
+    area: Rect,
+    theme: &super::theme::Theme,
+    directory: &str,
+) {
+    let Some(skill) = data
+        .skills
+        .installed
+        .iter()
+        .find(|s| s.directory.eq_ignore_ascii_case(directory))
+    else {
+        frame.render_widget(
+            Paragraph::new(texts::tui_skill_not_found())
+                .style(Style::default().fg(theme.dim))
+                .wrap(Wrap { trim: false })
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Plain)
+                        .border_style(pane_border_style(app, Focus::Content, theme))
+                        .title(texts::tui_skills_detail_title()),
+                ),
+            area,
+        );
+        return;
+    };
+
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(pane_border_style(app, Focus::Content, theme))
+        .title(texts::tui_skills_detail_title());
+    frame.render_widget(outer.clone(), area);
+    let inner = outer.inner(area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(inner);
+
+    if app.focus == Focus::Content {
+        render_key_bar_center(
+            frame,
+            chunks[0],
+            theme,
+            &[
+                ("x", texts::tui_key_toggle()),
+                ("d", texts::tui_key_uninstall()),
+                ("s", texts::tui_key_sync()),
+            ],
+        );
+    }
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                texts::tui_label_directory(),
+                Style::default().fg(theme.accent),
+            ),
+            Span::raw(": "),
+            Span::raw(skill.directory.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled(texts::header_name(), Style::default().fg(theme.accent)),
+            Span::raw(": "),
+            Span::raw(skill.name.clone()),
+        ]),
+    ];
+
+    if let Some(desc) = skill
+        .description
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::styled(
+                texts::header_description(),
+                Style::default().fg(theme.accent),
+            ),
+            Span::raw(": "),
+        ]));
+        for line in desc.lines() {
+            lines.push(Line::raw(line.to_string()));
+        }
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            texts::tui_label_enabled_for(),
+            Style::default().fg(theme.accent),
+        ),
+        Span::raw(": "),
+        Span::raw(format!(
+            "claude={}  codex={}  gemini={}",
+            skill.apps.claude, skill.apps.codex, skill.apps.gemini
+        )),
+    ]));
+
+    if let (Some(owner), Some(name)) = (&skill.repo_owner, &skill.repo_name) {
+        lines.push(Line::from(vec![
+            Span::styled(texts::tui_label_repo(), Style::default().fg(theme.accent)),
+            Span::raw(": "),
+            Span::raw(format!("{owner}/{name}")),
+        ]));
+    }
+    if let Some(url) = skill.readme_url.as_deref().filter(|s| !s.trim().is_empty()) {
+        lines.push(Line::from(vec![
+            Span::styled(texts::tui_label_readme(), Style::default().fg(theme.accent)),
+            Span::raw(": "),
+            Span::raw(url.to_string()),
+        ]));
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        inset_left(chunks[1], 2),
+    );
 }
 
 fn render_editor(
@@ -487,6 +1139,664 @@ fn render_editor(
     }
 
     // Key bar already shows mode-specific shortcuts.
+}
+
+fn focus_block_style(active: bool, theme: &super::theme::Theme) -> Style {
+    if active {
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.dim)
+    }
+}
+
+fn add_form_key_items(focus: FormFocus, editing: bool) -> Vec<(&'static str, &'static str)> {
+    let mut keys = vec![
+        ("Tab", texts::tui_key_focus()),
+        ("Ctrl+S", texts::tui_key_save()),
+        ("Esc", texts::tui_key_close()),
+    ];
+
+    match focus {
+        FormFocus::Templates => keys.extend([
+            ("←→", texts::tui_key_select()),
+            ("Enter", texts::tui_key_apply()),
+        ]),
+        FormFocus::Fields => {
+            if editing {
+                keys.extend([
+                    ("←→", texts::tui_key_move()),
+                    ("Enter", texts::tui_key_exit_edit()),
+                ]);
+            } else {
+                keys.extend([
+                    ("↑↓", texts::tui_key_select()),
+                    ("Enter", texts::tui_key_edit_mode()),
+                    ("Space", texts::tui_key_toggle()),
+                ]);
+            }
+        }
+        FormFocus::JsonPreview => keys.extend([("↑↓", texts::tui_key_scroll())]),
+    }
+
+    keys
+}
+
+fn render_form_template_chips(
+    frame: &mut Frame<'_>,
+    labels: &[&str],
+    selected_idx: usize,
+    active: bool,
+    area: Rect,
+    theme: &super::theme::Theme,
+) {
+    let template_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(focus_block_style(active, theme))
+        .title(texts::tui_form_templates_title());
+    frame.render_widget(template_block.clone(), area);
+    let template_inner = template_block.inner(area);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (idx, label) in labels.iter().enumerate() {
+        let selected = idx == selected_idx;
+        let style = if selected {
+            active_chip_style(theme)
+        } else {
+            inactive_chip_style(theme)
+        };
+        spans.push(Span::styled(format!(" {label} "), style));
+        spans.push(Span::raw(" "));
+    }
+
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false }),
+        template_inner,
+    );
+}
+
+fn visible_text_window(text: &str, cursor: usize, width: usize) -> (String, u16) {
+    if width == 0 {
+        return (String::new(), 0);
+    }
+
+    let chars = text.chars().collect::<Vec<_>>();
+    let cursor = cursor.min(chars.len());
+
+    let mut cum: Vec<usize> = Vec::with_capacity(chars.len() + 1);
+    cum.push(0);
+    for c in &chars {
+        let w = UnicodeWidthChar::width(*c).unwrap_or(0);
+        cum.push(cum.last().unwrap_or(&0).saturating_add(w));
+    }
+
+    let cursor_x = cum.get(cursor).copied().unwrap_or(0);
+    let target = cursor_x.saturating_sub(width.saturating_sub(1));
+    let mut start_idx = 0usize;
+    while start_idx < cum.len() && cum[start_idx] < target {
+        start_idx += 1;
+    }
+
+    let mut end_idx = start_idx;
+    while end_idx < chars.len() && cum[end_idx + 1].saturating_sub(cum[start_idx]) <= width {
+        end_idx += 1;
+    }
+
+    let visible = chars
+        .get(start_idx..end_idx)
+        .unwrap_or_default()
+        .iter()
+        .collect::<String>();
+    let cursor_in_window = cursor_x.saturating_sub(*cum.get(start_idx).unwrap_or(&0));
+
+    (visible, cursor_in_window.min(width) as u16)
+}
+
+fn render_form_json_preview(
+    frame: &mut Frame<'_>,
+    json_text: &str,
+    scroll: usize,
+    active: bool,
+    area: Rect,
+    theme: &super::theme::Theme,
+) {
+    let json_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(focus_block_style(active, theme))
+        .title(texts::tui_form_json_title());
+    frame.render_widget(json_block.clone(), area);
+    let json_inner = json_block.inner(area);
+
+    let lines = json_text
+        .lines()
+        .map(|s| Line::raw(s.to_string()))
+        .collect::<Vec<_>>();
+
+    let height = json_inner.height as usize;
+    if height == 0 {
+        return;
+    }
+    let max_start = lines.len().saturating_sub(height);
+    let start = scroll.min(max_start);
+    let end = (start + height).min(lines.len());
+
+    frame.render_widget(
+        Paragraph::new(lines[start..end].to_vec()).wrap(Wrap { trim: false }),
+        json_inner,
+    );
+}
+
+fn render_add_form(
+    frame: &mut Frame<'_>,
+    app: &App,
+    _data: &UiData,
+    form: &FormState,
+    area: Rect,
+    theme: &super::theme::Theme,
+) {
+    match form {
+        FormState::ProviderAdd(provider) => {
+            render_provider_add_form(frame, app, provider, area, theme)
+        }
+        FormState::McpAdd(mcp) => render_mcp_add_form(frame, app, mcp, area, theme),
+    }
+}
+
+fn render_provider_add_form(
+    frame: &mut Frame<'_>,
+    app: &App,
+    provider: &super::form::ProviderAddFormState,
+    area: Rect,
+    theme: &super::theme::Theme,
+) {
+    let title = match &provider.mode {
+        super::form::FormMode::Add => texts::tui_provider_add_title().to_string(),
+        super::form::FormMode::Edit { .. } => {
+            texts::tui_provider_edit_title(provider.name.value.trim())
+        }
+    };
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(pane_border_style(app, Focus::Content, theme))
+        .title(title);
+    frame.render_widget(outer.clone(), area);
+    let inner = outer.inner(area);
+
+    let template_height = if matches!(provider.mode, super::form::FormMode::Add) {
+        3
+    } else {
+        0
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(template_height),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+
+    render_key_bar(
+        frame,
+        chunks[0],
+        theme,
+        &add_form_key_items(provider.focus, provider.editing),
+    );
+
+    if matches!(provider.mode, super::form::FormMode::Add) {
+        let labels = provider.template_labels();
+        render_form_template_chips(
+            frame,
+            &labels,
+            provider.template_idx,
+            matches!(provider.focus, FormFocus::Templates),
+            chunks[1],
+            theme,
+        );
+    }
+
+    // Body: fields + JSON preview
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(chunks[2]);
+
+    // Fields
+    let fields_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(focus_block_style(
+            matches!(provider.focus, FormFocus::Fields),
+            theme,
+        ))
+        .title(texts::tui_form_fields_title());
+    frame.render_widget(fields_block.clone(), body[0]);
+    let fields_inner = fields_block.inner(body[0]);
+
+    let fields_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(3)])
+        .split(fields_inner);
+
+    let fields = provider.fields();
+    let header = Row::new(vec![
+        Cell::from(pad2(texts::tui_header_field())),
+        Cell::from(texts::tui_header_value()),
+    ])
+    .style(Style::default().fg(theme.dim).add_modifier(Modifier::BOLD));
+
+    let rows = fields.iter().map(|field| {
+        let (label, value) = provider_field_label_and_value(provider, *field);
+        Row::new(vec![Cell::from(pad2(&label)), Cell::from(value)])
+    });
+
+    let table = Table::new(rows, [Constraint::Length(22), Constraint::Min(10)])
+        .header(header)
+        .block(Block::default().borders(Borders::NONE))
+        .row_highlight_style(selection_style(theme))
+        .highlight_symbol(highlight_symbol(theme));
+
+    let mut state = TableState::default();
+    if !fields.is_empty() {
+        state.select(Some(provider.field_idx.min(fields.len() - 1)));
+    }
+    frame.render_stateful_widget(table, fields_chunks[0], &mut state);
+
+    // Editor / help line
+    let editor_active = matches!(provider.focus, FormFocus::Fields) && provider.editing;
+    let editor_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(focus_block_style(editor_active, theme))
+        .title(if editor_active {
+            texts::tui_form_editing_title()
+        } else {
+            texts::tui_form_input_title()
+        });
+    frame.render_widget(editor_block.clone(), fields_chunks[1]);
+    let editor_inner = editor_block.inner(fields_chunks[1]);
+
+    let selected = fields
+        .get(provider.field_idx.min(fields.len().saturating_sub(1)))
+        .copied();
+    if let Some(field) = selected {
+        if let Some(input) = provider.input(field) {
+            let (visible, cursor_x) =
+                visible_text_window(&input.value, input.cursor, editor_inner.width as usize);
+            frame.render_widget(
+                Paragraph::new(Line::raw(visible)).wrap(Wrap { trim: false }),
+                editor_inner,
+            );
+
+            if editor_active {
+                let x = editor_inner.x + cursor_x.min(editor_inner.width.saturating_sub(1));
+                let y = editor_inner.y;
+                frame.set_cursor_position((x, y));
+            }
+        } else {
+            let (line, _cursor_col) =
+                provider_field_editor_line(provider, selected, editor_inner.width as usize);
+            frame.render_widget(
+                Paragraph::new(line).wrap(Wrap { trim: false }),
+                editor_inner,
+            );
+        }
+    } else {
+        frame.render_widget(
+            Paragraph::new(Line::raw("")).wrap(Wrap { trim: false }),
+            editor_inner,
+        );
+    }
+
+    // JSON Preview
+    let json_value =
+        super::form::strip_provider_internal_fields(&provider.to_provider_json_value());
+    let json_text = serde_json::to_string_pretty(&json_value).unwrap_or_else(|_| "{}".to_string());
+    render_form_json_preview(
+        frame,
+        &json_text,
+        provider.json_scroll,
+        matches!(provider.focus, FormFocus::JsonPreview),
+        body[1],
+        theme,
+    );
+}
+
+fn provider_field_label_and_value(
+    provider: &super::form::ProviderAddFormState,
+    field: ProviderAddField,
+) -> (String, String) {
+    let label = match field {
+        ProviderAddField::Id => texts::tui_label_id().to_string(),
+        ProviderAddField::Name => texts::header_name().to_string(),
+        ProviderAddField::WebsiteUrl => {
+            strip_trailing_colon(texts::website_url_label()).to_string()
+        }
+        ProviderAddField::Notes => strip_trailing_colon(texts::notes_label()).to_string(),
+        ProviderAddField::ClaudeBaseUrl => texts::tui_label_base_url().to_string(),
+        ProviderAddField::ClaudeApiKey => texts::tui_label_api_key().to_string(),
+        ProviderAddField::CodexBaseUrl => texts::tui_label_base_url().to_string(),
+        ProviderAddField::CodexModel => texts::model_label().to_string(),
+        ProviderAddField::CodexWireApi => {
+            strip_trailing_colon(texts::codex_wire_api_label()).to_string()
+        }
+        ProviderAddField::CodexRequiresOpenaiAuth => {
+            strip_trailing_colon(texts::codex_auth_mode_label()).to_string()
+        }
+        ProviderAddField::CodexEnvKey => {
+            strip_trailing_colon(texts::codex_env_key_label()).to_string()
+        }
+        ProviderAddField::CodexApiKey => texts::tui_label_api_key().to_string(),
+        ProviderAddField::GeminiAuthType => {
+            strip_trailing_colon(texts::auth_type_label()).to_string()
+        }
+        ProviderAddField::GeminiApiKey => texts::tui_label_api_key().to_string(),
+        ProviderAddField::GeminiBaseUrl => texts::tui_label_base_url().to_string(),
+        ProviderAddField::IncludeCommonConfig => texts::tui_form_attach_common_config().to_string(),
+    };
+
+    let value = match field {
+        ProviderAddField::CodexWireApi => provider.codex_wire_api.as_str().to_string(),
+        ProviderAddField::CodexRequiresOpenaiAuth => {
+            if provider.codex_requires_openai_auth {
+                format!("[{}]", texts::tui_marker_active())
+            } else {
+                "[ ]".to_string()
+            }
+        }
+        ProviderAddField::IncludeCommonConfig => {
+            if provider.include_common_config {
+                format!("[{}]", texts::tui_marker_active())
+            } else {
+                "[ ]".to_string()
+            }
+        }
+        ProviderAddField::GeminiAuthType => match provider.gemini_auth_type {
+            GeminiAuthType::OAuth => "oauth".to_string(),
+            GeminiAuthType::ApiKey => "api_key".to_string(),
+        },
+        _ => provider
+            .input(field)
+            .map(|v| v.value.trim().to_string())
+            .unwrap_or_default(),
+    };
+
+    (
+        label,
+        if value.is_empty() {
+            texts::tui_na().to_string()
+        } else {
+            value
+        },
+    )
+}
+
+fn provider_field_editor_line(
+    provider: &super::form::ProviderAddFormState,
+    selected: Option<ProviderAddField>,
+    _width: usize,
+) -> (Line<'static>, usize) {
+    let Some(field) = selected else {
+        return (Line::raw(""), 0);
+    };
+
+    if let Some(input) = provider.input(field) {
+        let shown = if matches!(
+            field,
+            ProviderAddField::ClaudeApiKey
+                | ProviderAddField::CodexApiKey
+                | ProviderAddField::GeminiApiKey
+        ) {
+            input.value.clone()
+        } else {
+            input.value.clone()
+        };
+        (Line::raw(shown), input.cursor)
+    } else {
+        let text = match field {
+            ProviderAddField::CodexWireApi => {
+                format!("wire_api = {}", provider.codex_wire_api.as_str())
+            }
+            ProviderAddField::CodexRequiresOpenaiAuth => format!(
+                "requires_openai_auth = {}",
+                provider.codex_requires_openai_auth
+            ),
+            ProviderAddField::IncludeCommonConfig => {
+                format!("apply_common_config = {}", provider.include_common_config)
+            }
+            ProviderAddField::GeminiAuthType => {
+                format!("auth_type = {}", provider.gemini_auth_type.as_str())
+            }
+            _ => String::new(),
+        };
+        (Line::raw(text), 0)
+    }
+}
+
+fn render_mcp_add_form(
+    frame: &mut Frame<'_>,
+    app: &App,
+    mcp: &super::form::McpAddFormState,
+    area: Rect,
+    theme: &super::theme::Theme,
+) {
+    let title = match &mcp.mode {
+        super::form::FormMode::Add => texts::tui_mcp_add_title().to_string(),
+        super::form::FormMode::Edit { .. } => texts::tui_mcp_edit_title(mcp.name.value.trim()),
+    };
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(pane_border_style(app, Focus::Content, theme))
+        .title(title);
+    frame.render_widget(outer.clone(), area);
+    let inner = outer.inner(area);
+
+    let template_height = if matches!(mcp.mode, super::form::FormMode::Add) {
+        3
+    } else {
+        0
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(template_height),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+
+    render_key_bar(
+        frame,
+        chunks[0],
+        theme,
+        &add_form_key_items(mcp.focus, mcp.editing),
+    );
+
+    if matches!(mcp.mode, super::form::FormMode::Add) {
+        let labels = mcp.template_labels();
+        render_form_template_chips(
+            frame,
+            &labels,
+            mcp.template_idx,
+            matches!(mcp.focus, FormFocus::Templates),
+            chunks[1],
+            theme,
+        );
+    }
+
+    // Body: fields + JSON preview
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(chunks[2]);
+
+    // Fields
+    let fields_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(focus_block_style(
+            matches!(mcp.focus, FormFocus::Fields),
+            theme,
+        ))
+        .title(texts::tui_form_fields_title());
+    frame.render_widget(fields_block.clone(), body[0]);
+    let fields_inner = fields_block.inner(body[0]);
+
+    let fields_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(3)])
+        .split(fields_inner);
+
+    let fields = mcp.fields();
+    let header = Row::new(vec![
+        Cell::from(pad2(texts::tui_header_field())),
+        Cell::from(texts::tui_header_value()),
+    ])
+    .style(Style::default().fg(theme.dim).add_modifier(Modifier::BOLD));
+
+    let rows = fields.iter().map(|field| {
+        let (label, value) = mcp_field_label_and_value(mcp, *field);
+        Row::new(vec![Cell::from(pad2(&label)), Cell::from(value)])
+    });
+
+    let table = Table::new(rows, [Constraint::Length(22), Constraint::Min(10)])
+        .header(header)
+        .block(Block::default().borders(Borders::NONE))
+        .row_highlight_style(selection_style(theme))
+        .highlight_symbol(highlight_symbol(theme));
+
+    let mut state = TableState::default();
+    if !fields.is_empty() {
+        state.select(Some(mcp.field_idx.min(fields.len() - 1)));
+    }
+    frame.render_stateful_widget(table, fields_chunks[0], &mut state);
+
+    // Editor
+    let editor_active = matches!(mcp.focus, FormFocus::Fields) && mcp.editing;
+    let editor_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(focus_block_style(editor_active, theme))
+        .title(if editor_active {
+            texts::tui_form_editing_title()
+        } else {
+            texts::tui_form_input_title()
+        });
+    frame.render_widget(editor_block.clone(), fields_chunks[1]);
+    let editor_inner = editor_block.inner(fields_chunks[1]);
+
+    let selected = fields
+        .get(mcp.field_idx.min(fields.len().saturating_sub(1)))
+        .copied();
+    if let Some(field) = selected {
+        if let Some(input) = mcp.input(field) {
+            let (visible, cursor_x) =
+                visible_text_window(&input.value, input.cursor, editor_inner.width as usize);
+            frame.render_widget(
+                Paragraph::new(Line::raw(visible)).wrap(Wrap { trim: false }),
+                editor_inner,
+            );
+            if editor_active {
+                let x = editor_inner.x + cursor_x.min(editor_inner.width.saturating_sub(1));
+                let y = editor_inner.y;
+                frame.set_cursor_position((x, y));
+            }
+        } else {
+            let (line, _cursor) = mcp_field_editor_line(mcp, selected, editor_inner.width as usize);
+            frame.render_widget(
+                Paragraph::new(line).wrap(Wrap { trim: false }),
+                editor_inner,
+            );
+        }
+    }
+
+    // JSON Preview
+    let json_text = serde_json::to_string_pretty(&mcp.to_mcp_server_json_value())
+        .unwrap_or_else(|_| "{}".to_string());
+    render_form_json_preview(
+        frame,
+        &json_text,
+        mcp.json_scroll,
+        matches!(mcp.focus, FormFocus::JsonPreview),
+        body[1],
+        theme,
+    );
+}
+
+fn mcp_field_label_and_value(
+    mcp: &super::form::McpAddFormState,
+    field: McpAddField,
+) -> (String, String) {
+    let label = match field {
+        McpAddField::Id => texts::tui_label_id().to_string(),
+        McpAddField::Name => texts::header_name().to_string(),
+        McpAddField::Command => texts::tui_label_command().to_string(),
+        McpAddField::Args => texts::tui_label_args().to_string(),
+        McpAddField::AppClaude => texts::tui_label_app_claude().to_string(),
+        McpAddField::AppCodex => texts::tui_label_app_codex().to_string(),
+        McpAddField::AppGemini => texts::tui_label_app_gemini().to_string(),
+    };
+
+    let value = match field {
+        McpAddField::AppClaude => {
+            if mcp.apps.claude {
+                format!("[{}]", texts::tui_marker_active())
+            } else {
+                "[ ]".to_string()
+            }
+        }
+        McpAddField::AppCodex => {
+            if mcp.apps.codex {
+                format!("[{}]", texts::tui_marker_active())
+            } else {
+                "[ ]".to_string()
+            }
+        }
+        McpAddField::AppGemini => {
+            if mcp.apps.gemini {
+                format!("[{}]", texts::tui_marker_active())
+            } else {
+                "[ ]".to_string()
+            }
+        }
+        _ => mcp
+            .input(field)
+            .map(|v| v.value.trim().to_string())
+            .unwrap_or_default(),
+    };
+
+    (
+        label,
+        if value.is_empty() {
+            texts::tui_na().to_string()
+        } else {
+            value
+        },
+    )
+}
+
+fn mcp_field_editor_line(
+    mcp: &super::form::McpAddFormState,
+    selected: Option<McpAddField>,
+    _width: usize,
+) -> (Line<'static>, usize) {
+    let Some(field) = selected else {
+        return (Line::raw(""), 0);
+    };
+
+    let text = match field {
+        McpAddField::AppClaude => format!("claude = {}", mcp.apps.claude),
+        McpAddField::AppCodex => format!("codex = {}", mcp.apps.codex),
+        McpAddField::AppGemini => format!("gemini = {}", mcp.apps.gemini),
+        _ => String::new(),
+    };
+
+    (Line::raw(text), 0)
 }
 
 fn split_filter_area(area: Rect, app: &App) -> (Option<Rect>, Rect) {
@@ -1660,6 +2970,91 @@ fn render_overlay(frame: &mut Frame<'_>, app: &App, data: &UiData, theme: &super
             state.select(Some(*selected));
             frame.render_stateful_widget(list, chunks[1], &mut state);
         }
+        Overlay::SkillsSyncMethodPicker { selected } => {
+            let area = centered_rect(60, 45, frame.area());
+            frame.render_widget(Clear, area);
+
+            let outer = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Plain)
+                .border_style(Style::default().fg(theme.dim))
+                .title(texts::tui_skills_sync_method_title());
+            frame.render_widget(outer.clone(), area);
+            let inner = outer.inner(area);
+
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(0)])
+                .split(inner);
+
+            render_key_bar(
+                frame,
+                chunks[0],
+                theme,
+                &[
+                    ("Enter", texts::tui_key_apply()),
+                    ("Esc", texts::tui_key_cancel()),
+                ],
+            );
+
+            let current = data.skills.sync_method;
+            let methods = [
+                crate::services::skill::SyncMethod::Auto,
+                crate::services::skill::SyncMethod::Symlink,
+                crate::services::skill::SyncMethod::Copy,
+            ];
+
+            let items = methods.into_iter().map(|method| {
+                let marker = if method == current {
+                    texts::tui_marker_active()
+                } else {
+                    texts::tui_marker_inactive()
+                };
+                ListItem::new(Line::from(Span::raw(format!(
+                    "{marker}  {}",
+                    texts::tui_skills_sync_method_name(method)
+                ))))
+            });
+
+            let list = List::new(items)
+                .highlight_style(selection_style(theme))
+                .highlight_symbol(highlight_symbol(theme));
+
+            let mut state = ListState::default();
+            state.select(Some(*selected));
+            frame.render_stateful_widget(list, chunks[1], &mut state);
+        }
+        Overlay::Loading { title, message } => {
+            let area = centered_rect(60, 30, frame.area());
+            frame.render_widget(Clear, area);
+
+            let spinner = match app.tick % 4 {
+                1 => "/",
+                2 => "-",
+                3 => "\\",
+                _ => "|",
+            };
+            let full_title = format!("{spinner} {title}");
+
+            let outer = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Plain)
+                .border_style(Style::default().fg(theme.dim))
+                .title(full_title);
+            frame.render_widget(outer.clone(), area);
+            let inner = outer.inner(area);
+
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(0)])
+                .split(inner);
+
+            render_key_bar(frame, chunks[0], theme, &[("Esc", texts::tui_key_cancel())]);
+            frame.render_widget(
+                Paragraph::new(Line::raw(message.clone())).wrap(Wrap { trim: false }),
+                chunks[1],
+            );
+        }
         Overlay::SpeedtestRunning { url } => {
             let area = centered_rect(70, 30, frame.area());
             frame.render_widget(Clear, area);
@@ -1762,16 +3157,18 @@ mod tests {
 
     use crate::{
         app_config::AppType,
+        cli::i18n::texts,
         cli::tui::{
             app::{App, Focus, Overlay, TextInputState, TextSubmit},
             data::{
                 ConfigSnapshot, McpSnapshot, PromptsSnapshot, ProviderRow, ProvidersSnapshot,
-                UiData,
+                SkillsSnapshot, UiData,
             },
             route::Route,
             theme::theme_for,
         },
         provider::Provider,
+        services::skill::{InstalledSkill, SkillApps, SkillRepo, SyncMethod},
     };
 
     #[test]
@@ -1783,6 +3180,18 @@ mod tests {
         let long = "你".repeat(9);
         let masked = super::mask_api_key(&long);
         assert!(masked.ends_with("..."));
+    }
+
+    #[test]
+    fn provider_form_shows_full_api_key_in_table_value() {
+        let mut form = crate::cli::tui::form::ProviderAddFormState::new(AppType::Claude);
+        form.claude_api_key.set("sk-test-1234567890");
+
+        let (_label, value) = super::provider_field_label_and_value(
+            &form,
+            crate::cli::tui::form::ProviderAddField::ClaudeApiKey,
+        );
+        assert_eq!(value, "sk-test-1234567890");
     }
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -1864,7 +3273,59 @@ mod tests {
             mcp: McpSnapshot::default(),
             prompts: PromptsSnapshot::default(),
             config: ConfigSnapshot::default(),
+            skills: SkillsSnapshot::default(),
         }
+    }
+
+    fn installed_skill(directory: &str, name: &str) -> InstalledSkill {
+        InstalledSkill {
+            id: format!("local:{directory}"),
+            name: name.to_string(),
+            description: Some("Demo".to_string()),
+            directory: directory.to_string(),
+            readme_url: None,
+            repo_owner: None,
+            repo_name: None,
+            repo_branch: None,
+            apps: SkillApps {
+                claude: true,
+                codex: false,
+                gemini: false,
+            },
+            installed_at: 1,
+        }
+    }
+
+    #[test]
+    fn add_form_template_chips_are_single_row() {
+        let _lock = lock_env();
+        let _no_color = EnvGuard::remove("NO_COLOR");
+
+        let mut app = App::new(Some(AppType::Claude));
+        app.route = Route::Providers;
+        app.focus = Focus::Content;
+        app.form = Some(crate::cli::tui::form::FormState::ProviderAdd(
+            crate::cli::tui::form::ProviderAddFormState::new(AppType::Claude),
+        ));
+
+        let data = minimal_data(&app.app_type);
+        let buf = render(&app, &data);
+
+        let mut chips_y = None;
+        for y in 0..buf.area.height {
+            let line = line_at(&buf, y);
+            if line.contains("Custom") && line.contains("Claude Official") {
+                chips_y = Some(y);
+                break;
+            }
+        }
+
+        let chips_y = chips_y.expect("template chips row missing from add form");
+        let next = line_at(&buf, chips_y + 1);
+        assert!(
+            next.contains('└'),
+            "expected template block border after chips, got: {next}"
+        );
     }
 
     #[test]
@@ -1967,6 +3428,69 @@ mod tests {
             !all.contains("View Current Configuration"),
             "expected nav to not include View Current Configuration"
         );
+    }
+
+    #[test]
+    fn skills_page_renders_sync_method_and_installed_rows() {
+        let _lock = lock_env();
+        let _no_color = EnvGuard::remove("NO_COLOR");
+
+        let mut app = App::new(Some(AppType::Claude));
+        app.route = Route::Skills;
+        app.focus = Focus::Content;
+
+        let mut data = minimal_data(&app.app_type);
+        data.skills.sync_method = SyncMethod::Copy;
+        data.skills.installed = vec![installed_skill("hello-skill", "Hello Skill")];
+
+        let buf = render(&app, &data);
+        let all = all_text(&buf);
+
+        assert!(all.contains(&texts::tui_skills_installed_counts(1, 0, 0)));
+        assert!(all.contains("hello-skill"));
+        assert!(all.contains("Hello Skill"));
+    }
+
+    #[test]
+    fn skills_discover_page_shows_hint_when_empty() {
+        let _lock = lock_env();
+        let _no_color = EnvGuard::remove("NO_COLOR");
+
+        let mut app = App::new(Some(AppType::Claude));
+        app.route = Route::SkillsDiscover;
+        app.focus = Focus::Content;
+        app.skills_discover_results = vec![];
+        app.skills_discover_query = String::new();
+
+        let data = minimal_data(&app.app_type);
+        let buf = render(&app, &data);
+        let all = all_text(&buf);
+
+        assert!(all.contains(texts::tui_skills_discover_hint()));
+    }
+
+    #[test]
+    fn skills_repos_page_renders_repo_rows() {
+        let _lock = lock_env();
+        let _no_color = EnvGuard::remove("NO_COLOR");
+
+        let mut app = App::new(Some(AppType::Claude));
+        app.route = Route::SkillsRepos;
+        app.focus = Focus::Content;
+
+        let mut data = minimal_data(&app.app_type);
+        data.skills.repos = vec![SkillRepo {
+            owner: "anthropics".to_string(),
+            name: "skills".to_string(),
+            branch: "main".to_string(),
+            enabled: true,
+            skills_path: None,
+        }];
+
+        let buf = render(&app, &data);
+        let all = all_text(&buf);
+
+        assert!(all.contains("anthropics/skills"));
     }
 
     #[test]

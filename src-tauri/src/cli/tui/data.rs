@@ -9,7 +9,7 @@ use crate::error::AppError;
 use crate::prompt::Prompt;
 use crate::provider::Provider;
 use crate::services::config::BackupInfo;
-use crate::services::{ConfigService, McpService, PromptService, ProviderService};
+use crate::services::{ConfigService, McpService, PromptService, ProviderService, SkillService};
 use crate::store::AppState;
 
 #[derive(Debug, Clone)]
@@ -57,11 +57,19 @@ pub struct ConfigSnapshot {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct SkillsSnapshot {
+    pub installed: Vec<crate::services::skill::InstalledSkill>,
+    pub repos: Vec<crate::services::skill::SkillRepo>,
+    pub sync_method: crate::services::skill::SyncMethod,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct UiData {
     pub providers: ProvidersSnapshot,
     pub mcp: McpSnapshot,
     pub prompts: PromptsSnapshot,
     pub config: ConfigSnapshot,
+    pub skills: SkillsSnapshot,
 }
 
 pub(crate) fn load_state() -> Result<AppState, AppError> {
@@ -79,12 +87,14 @@ impl UiData {
         let mcp = load_mcp(&state)?;
         let prompts = load_prompts(&state, app_type)?;
         let config = load_config_snapshot(&state, app_type)?;
+        let skills = load_skills_snapshot()?;
 
         Ok(Self {
             providers,
             mcp,
             prompts,
             config,
+            skills,
         })
     }
 }
@@ -147,9 +157,12 @@ fn extract_api_url(settings_config: &Value, app_type: &AppType) -> Option<String
             None
         }
         AppType::Gemini => settings_config
-            .get("env")?
-            .get("GEMINI_BASE_URL")
-            .or_else(|| settings_config.get("env")?.get("BASE_URL"))?
+            .get("env")
+            .and_then(|env| {
+                env.get("GOOGLE_GEMINI_BASE_URL")
+                    .or_else(|| env.get("GEMINI_BASE_URL"))
+                    .or_else(|| env.get("BASE_URL"))
+            })?
             .as_str()
             .map(|s| s.to_string()),
     }
@@ -203,4 +216,49 @@ fn load_config_snapshot(state: &AppState, app_type: &AppType) -> Result<ConfigSn
         backups,
         common_snippet,
     })
+}
+
+fn load_skills_snapshot() -> Result<SkillsSnapshot, AppError> {
+    Ok(SkillsSnapshot {
+        installed: SkillService::list_installed()?,
+        repos: SkillService::list_repos()?,
+        sync_method: SkillService::get_sync_method()?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn extract_api_url_gemini_prefers_google_env_key() {
+        let settings = json!({
+            "env": {
+                "GOOGLE_GEMINI_BASE_URL": "https://google.example",
+                "GEMINI_BASE_URL": "https://legacy.example",
+                "BASE_URL": "https://fallback.example"
+            }
+        });
+
+        assert_eq!(
+            extract_api_url(&settings, &AppType::Gemini),
+            Some("https://google.example".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_api_url_gemini_falls_back_to_legacy_keys() {
+        let settings = json!({
+            "env": {
+                "GEMINI_BASE_URL": "https://legacy.example",
+                "BASE_URL": "https://fallback.example"
+            }
+        });
+
+        assert_eq!(
+            extract_api_url(&settings, &AppType::Gemini),
+            Some("https://legacy.example".to_string())
+        );
+    }
 }

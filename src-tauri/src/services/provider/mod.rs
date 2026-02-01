@@ -412,6 +412,65 @@ mod tests {
 
     #[test]
     #[serial]
+    fn common_config_snippet_can_be_disabled_per_provider_for_claude() {
+        let temp_home = TempDir::new().expect("create temp home");
+        let _env = EnvGuard::set_home(temp_home.path());
+        std::fs::create_dir_all(crate::config::get_claude_config_dir())
+            .expect("create ~/.claude (initialized)");
+
+        let mut config = MultiAppConfig::default();
+        config.ensure_app(&AppType::Claude);
+        config.common_config_snippets.claude = Some(
+            r#"{"env":{"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC":1},"includeCoAuthoredBy":false}"#
+                .to_string(),
+        );
+
+        let state = AppState {
+            config: RwLock::new(config),
+        };
+
+        let provider: Provider = serde_json::from_value(json!({
+            "id": "p1",
+            "name": "First",
+            "settingsConfig": {
+                "env": {
+                    "ANTHROPIC_AUTH_TOKEN": "token",
+                    "ANTHROPIC_BASE_URL": "https://claude.example"
+                }
+            },
+            "meta": { "applyCommonConfig": false }
+        }))
+        .expect("parse provider");
+
+        ProviderService::add(&state, AppType::Claude, provider).expect("add should succeed");
+
+        let settings_path = get_claude_settings_path();
+        let live: Value = read_json_file(&settings_path).expect("read live settings");
+
+        assert!(
+            live.get("includeCoAuthoredBy").is_none(),
+            "common snippet should not be merged when applyCommonConfig=false"
+        );
+        assert!(
+            !live
+                .get("env")
+                .and_then(Value::as_object)
+                .map(|env| env.contains_key("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"))
+                .unwrap_or(false),
+            "common env keys should not be merged when applyCommonConfig=false"
+        );
+        assert_eq!(
+            live.get("env")
+                .and_then(Value::as_object)
+                .and_then(|env| env.get("ANTHROPIC_AUTH_TOKEN"))
+                .and_then(Value::as_str),
+            Some("token"),
+            "provider env should still be written"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn common_config_snippet_is_not_persisted_into_provider_snapshot_on_switch() {
         let temp_home = TempDir::new().expect("create temp home");
         let _env = EnvGuard::set_home(temp_home.path());
@@ -609,6 +668,67 @@ base_url = "http://localhost:8080"
         assert!(
             !extracted.contains("[model_providers"),
             "should remove entire model_providers table"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn common_config_snippet_can_be_disabled_per_provider_for_codex() {
+        let temp_home = TempDir::new().expect("create temp home");
+        let _env = EnvGuard::set_home(temp_home.path());
+        std::fs::create_dir_all(crate::codex_config::get_codex_config_dir())
+            .expect("create ~/.codex (initialized)");
+
+        let config_path = get_codex_config_path();
+        std::fs::write(
+            &config_path,
+            "disable_response_storage = true\nnetwork_access = \"restricted\"\n",
+        )
+        .expect("seed config.toml");
+
+        let mut config = MultiAppConfig::default();
+        config.ensure_app(&AppType::Codex);
+        config.common_config_snippets.codex = Some("disable_response_storage = true".to_string());
+        {
+            let manager = config
+                .get_manager_mut(&AppType::Codex)
+                .expect("codex manager");
+            manager.current = "p1".to_string();
+            manager.providers.insert(
+                "p1".to_string(),
+                Provider::with_id(
+                    "p1".to_string(),
+                    "First".to_string(),
+                    json!({ "config": "base_url = \"https://api.one.example/v1\"\n" }),
+                    None,
+                ),
+            );
+            manager.providers.insert(
+                "p2".to_string(),
+                serde_json::from_value(json!({
+                    "id": "p2",
+                    "name": "Second",
+                    "settingsConfig": { "config": "base_url = \"https://api.two.example/v1\"\n" },
+                    "meta": { "applyCommonConfig": false }
+                }))
+                .expect("parse provider p2"),
+            );
+        }
+
+        let state = AppState {
+            config: RwLock::new(config),
+        };
+
+        ProviderService::switch(&state, AppType::Codex, "p2").expect("switch should succeed");
+
+        let live_text = std::fs::read_to_string(get_codex_config_path()).expect("read config.toml");
+        assert!(
+            !live_text.contains("disable_response_storage = true"),
+            "common snippet should be removed when applyCommonConfig=false"
+        );
+        assert!(
+            live_text.contains("network_access = \"restricted\""),
+            "unrelated root config should be preserved"
         );
     }
 
@@ -972,6 +1092,30 @@ impl ProviderService {
         }
     }
 
+    fn strip_toml_tables(dst: &mut toml_edit::Table, src: &toml_edit::Table) {
+        for (key, src_item) in src.iter() {
+            let should_remove = if let Some(src_table) = src_item.as_table() {
+                match dst.get_mut(key) {
+                    Some(dst_item) => {
+                        if let Some(dst_table) = dst_item.as_table_mut() {
+                            Self::strip_toml_tables(dst_table, src_table);
+                            dst_table.is_empty()
+                        } else {
+                            true
+                        }
+                    }
+                    None => false,
+                }
+            } else {
+                dst.contains_key(key)
+            };
+
+            if should_remove {
+                dst.remove(key);
+            }
+        }
+    }
+
     /// 归一化 Claude 模型键：读旧键(ANTHROPIC_SMALL_FAST_MODEL)，写新键(DEFAULT_*), 并删除旧键
     fn normalize_claude_models_in_value(settings: &mut Value) -> bool {
         let mut changed = false;
@@ -1114,10 +1258,17 @@ impl ProviderService {
     }
 
     fn apply_post_commit(state: &AppState, action: &PostCommitAction) -> Result<(), AppError> {
+        let apply_common_config = action
+            .provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.apply_common_config)
+            .unwrap_or(true);
         Self::write_live_snapshot(
             &action.app_type,
             &action.provider,
             action.common_config_snippet.as_deref(),
+            apply_common_config,
         )?;
         if action.sync_mcp {
             // 使用 v3.7.0 统一的 MCP 同步机制，支持所有应用
@@ -1820,6 +1971,7 @@ impl ProviderService {
     fn write_codex_live(
         provider: &Provider,
         common_config_snippet: Option<&str>,
+        apply_common_config: bool,
     ) -> Result<(), AppError> {
         use toml_edit::{value, Item, Table};
 
@@ -1900,7 +2052,11 @@ impl ProviderService {
                         format!("Codex common config snippet is not valid TOML: {e}"),
                     )
                 })?;
-                Self::merge_toml_tables(doc.as_table_mut(), common_doc.as_table());
+                if apply_common_config {
+                    Self::merge_toml_tables(doc.as_table_mut(), common_doc.as_table());
+                } else {
+                    Self::strip_toml_tables(doc.as_table_mut(), common_doc.as_table());
+                }
             }
         }
 
@@ -2290,11 +2446,28 @@ impl ProviderService {
         app_type: &AppType,
         provider: &Provider,
         common_config_snippet: Option<&str>,
+        apply_common_config: bool,
     ) -> Result<(), AppError> {
         match app_type {
-            AppType::Codex => Self::write_codex_live(provider, common_config_snippet),
-            AppType::Claude => Self::write_claude_live(provider, common_config_snippet),
-            AppType::Gemini => Self::write_gemini_live(provider, common_config_snippet), // 新增
+            AppType::Codex => {
+                Self::write_codex_live(provider, common_config_snippet, apply_common_config)
+            }
+            AppType::Claude => Self::write_claude_live(
+                provider,
+                if apply_common_config {
+                    common_config_snippet
+                } else {
+                    None
+                },
+            ),
+            AppType::Gemini => Self::write_gemini_live(
+                provider,
+                if apply_common_config {
+                    common_config_snippet
+                } else {
+                    None
+                },
+            ), // 新增
         }
     }
 
