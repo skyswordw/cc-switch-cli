@@ -5,11 +5,11 @@ use serde_json::json;
 use cc_switch_lib::MultiAppConfig;
 
 mod support;
-use support::{ensure_test_home, reset_test_fs, test_mutex};
+use support::{ensure_test_home, lock_test_mutex, reset_test_fs};
 
 #[test]
 fn provider_model_roundtrip_preserves_phase2_fields() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let home = ensure_test_home();
 

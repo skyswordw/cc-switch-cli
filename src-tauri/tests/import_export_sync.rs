@@ -1,19 +1,19 @@
 use futures::executor::block_on;
 use serde_json::json;
-use std::{fs, path::Path, sync::RwLock};
+use std::{fs, path::Path};
 
 use cc_switch_lib::{
-    get_claude_settings_path, read_json_file, AppError, AppState, AppType, ConfigService,
+    get_claude_settings_path, read_json_file, AppError, AppType, ConfigService, Database,
     MultiAppConfig, Provider, ProviderMeta,
 };
 
 #[path = "support.rs"]
 mod support;
-use support::{ensure_test_home, reset_test_fs, test_mutex};
+use support::{ensure_test_home, lock_test_mutex, reset_test_fs, state_from_config};
 
 #[test]
 fn sync_claude_provider_writes_live_settings() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let home = ensure_test_home();
 
@@ -69,7 +69,7 @@ fn sync_claude_provider_writes_live_settings() {
 
 #[test]
 fn sync_codex_provider_writes_auth_and_config() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
 
     let mut config = MultiAppConfig::default();
@@ -149,7 +149,7 @@ fn sync_codex_provider_writes_auth_and_config() {
 
 #[test]
 fn sync_enabled_to_codex_writes_enabled_servers() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
 
     let mut config = MultiAppConfig::default();
@@ -179,7 +179,7 @@ fn sync_enabled_to_codex_writes_enabled_servers() {
 
 #[test]
 fn sync_enabled_to_codex_preserves_non_mcp_content_and_style() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
 
     // 预置含有顶层注释与非 MCP 键的 config.toml
@@ -238,7 +238,7 @@ mode = "dev"
 
 #[test]
 fn sync_enabled_to_codex_migrates_erroneous_mcp_dot_servers_to_mcp_servers() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let path = cc_switch_lib::get_codex_config_path();
     if let Some(parent) = path.parent() {
@@ -276,7 +276,7 @@ fn sync_enabled_to_codex_migrates_erroneous_mcp_dot_servers_to_mcp_servers() {
 
 #[test]
 fn sync_enabled_to_codex_removes_servers_when_none_enabled() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let path = cc_switch_lib::get_codex_config_path();
     if let Some(parent) = path.parent() {
@@ -302,7 +302,7 @@ disabled = { type = "stdio", command = "noop" }
 
 #[test]
 fn sync_enabled_to_codex_returns_error_on_invalid_toml() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let path = cc_switch_lib::get_codex_config_path();
     if let Some(parent) = path.parent() {
@@ -343,7 +343,7 @@ fn sync_enabled_to_codex_returns_error_on_invalid_toml() {
 
 #[test]
 fn sync_codex_provider_missing_auth_returns_error() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
 
     let mut config = MultiAppConfig::default();
@@ -383,7 +383,7 @@ fn sync_codex_provider_missing_auth_returns_error() {
 
 #[test]
 fn write_codex_live_atomic_persists_auth_and_config() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
 
     let auth = json!({ "OPENAI_API_KEY": "dev-key" });
@@ -415,7 +415,7 @@ args = ["ok"]
 
 #[test]
 fn write_codex_live_atomic_rolls_back_auth_when_config_write_fails() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
 
     let auth_path = cc_switch_lib::get_codex_auth_path();
@@ -466,7 +466,7 @@ command = "noop"
 
 #[test]
 fn import_from_codex_adds_servers_from_mcp_servers_table() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let path = cc_switch_lib::get_codex_config_path();
     if let Some(parent) = path.parent() {
@@ -525,7 +525,7 @@ url = "https://example.com"
 
 #[test]
 fn import_from_codex_merges_into_existing_entries() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let path = cc_switch_lib::get_codex_config_path();
     if let Some(parent) = path.parent() {
@@ -556,6 +556,7 @@ command = "echo"
                 claude: false,
                 codex: false, // 初始未启用
                 gemini: false,
+                opencode: false,
             },
             description: None,
             homepage: None,
@@ -590,7 +591,7 @@ command = "echo"
 
 #[test]
 fn sync_claude_enabled_mcp_projects_to_user_config() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let mut config = MultiAppConfig::default();
 
@@ -642,7 +643,7 @@ fn sync_claude_enabled_mcp_projects_to_user_config() {
 
 #[test]
 fn import_from_claude_merges_into_config() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let home = ensure_test_home();
     let claude_path = home.join(".claude.json");
@@ -678,6 +679,7 @@ fn import_from_claude_merges_into_config() {
                 claude: false, // 初始未启用
                 codex: false,
                 gemini: false,
+                opencode: false,
             },
             description: None,
             homepage: None,
@@ -715,36 +717,58 @@ fn import_from_claude_merges_into_config() {
 
 #[test]
 fn create_backup_skips_missing_file() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let home = ensure_test_home();
-    let config_path = home.join(".cc-switch").join("config.json");
+    let db_path = home.join(".cc-switch").join("cc-switch.db");
 
-    // 未创建文件时应返回空字符串，不报错
-    let result = ConfigService::create_backup(&config_path, None).expect("create backup");
+    // 未创建数据库文件时应返回空字符串，不报错
+    let result = ConfigService::create_backup(&db_path, None).expect("create backup");
     assert!(
         result.is_empty(),
-        "expected empty backup id when config file missing"
+        "expected empty backup id when database missing"
     );
 }
 
 #[test]
 fn create_backup_generates_snapshot_file() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let home = ensure_test_home();
-    let config_dir = home.join(".cc-switch");
-    let config_path = config_dir.join("config.json");
-    fs::create_dir_all(&config_dir).expect("prepare config dir");
-    fs::write(&config_path, r#"{"version":2}"#).expect("write config file");
+    let db_path = home.join(".cc-switch").join("cc-switch.db");
 
-    let backup_id = ConfigService::create_backup(&config_path, None).expect("backup success");
+    // Seed DB with at least one provider so the SQL dump contains data.
+    let mut config = MultiAppConfig::default();
+    {
+        let manager = config
+            .get_manager_mut(&AppType::Claude)
+            .expect("claude manager");
+        manager.current = "p1".to_string();
+        manager.providers.insert(
+            "p1".to_string(),
+            Provider::with_id(
+                "p1".to_string(),
+                "Test Claude".to_string(),
+                json!({
+                    "env": { "ANTHROPIC_AUTH_TOKEN": "test-key" }
+                }),
+                None,
+            ),
+        );
+    }
+    let state = state_from_config(config);
+    state.save().expect("persist db");
+
+    let backup_id = ConfigService::create_backup(&db_path, None).expect("backup success");
     assert!(
         !backup_id.is_empty(),
         "backup id should contain timestamp information"
     );
 
-    let backup_path = config_dir.join("backups").join(format!("{backup_id}.json"));
+    let backup_path = home
+        .join(".cc-switch")
+        .join("backups")
+        .join(format!("{backup_id}.sql"));
     assert!(
         backup_path.exists(),
         "expected backup file at {}",
@@ -753,32 +777,37 @@ fn create_backup_generates_snapshot_file() {
 
     let backup_content = fs::read_to_string(&backup_path).expect("read backup");
     assert!(
-        backup_content.contains(r#""version":2"#),
-        "backup content should match original config"
+        backup_content.starts_with("-- CC Switch SQLite 导出"),
+        "backup content should be a CC Switch SQL export"
+    );
+    assert!(
+        backup_content.contains("p1"),
+        "backup content should include seeded provider data"
     );
 }
 
 #[test]
 fn create_backup_retains_only_latest_entries() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let home = ensure_test_home();
-    let config_dir = home.join(".cc-switch");
-    let config_path = config_dir.join("config.json");
-    fs::create_dir_all(&config_dir).expect("prepare config dir");
-    fs::write(&config_path, r#"{"version":3}"#).expect("write config file");
+    let db_path = home.join(".cc-switch").join("cc-switch.db");
 
-    let backups_dir = config_dir.join("backups");
+    // Ensure DB exists so backups are created.
+    let state = state_from_config(MultiAppConfig::default());
+    state.save().expect("persist db");
+
+    let backups_dir = home.join(".cc-switch").join("backups");
     fs::create_dir_all(&backups_dir).expect("create backups dir");
     for idx in 0..12 {
-        let manual = backups_dir.join(format!("manual_{idx:02}.json"));
-        fs::write(&manual, format!("{{\"idx\":{idx}}}")).expect("seed manual backup");
+        let manual = backups_dir.join(format!("manual_{idx:02}.sql"));
+        fs::write(&manual, format!("-- manual backup {idx}\n")).expect("seed manual backup");
     }
 
     std::thread::sleep(std::time::Duration::from_secs(1));
 
     let latest_backup_id =
-        ConfigService::create_backup(&config_path, None).expect("create backup with cleanup");
+        ConfigService::create_backup(&db_path, None).expect("create backup with cleanup");
     assert!(
         !latest_backup_id.is_empty(),
         "backup id should not be empty when config exists"
@@ -787,6 +816,7 @@ fn create_backup_retains_only_latest_entries() {
     let entries: Vec<_> = fs::read_dir(&backups_dir)
         .expect("read backups dir")
         .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "sql"))
         .collect();
     assert!(
         entries.len() <= 10,
@@ -794,7 +824,7 @@ fn create_backup_retains_only_latest_entries() {
         entries.len()
     );
 
-    let latest_path = backups_dir.join(format!("{latest_backup_id}.json"));
+    let latest_path = backups_dir.join(format!("{latest_backup_id}.sql"));
     assert!(
         latest_path.exists(),
         "latest backup {} should be preserved",
@@ -814,136 +844,123 @@ fn create_backup_retains_only_latest_entries() {
 
 #[test]
 fn import_config_from_path_overwrites_state_and_creates_backup() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let home = ensure_test_home();
 
-    let config_dir = home.join(".cc-switch");
-    fs::create_dir_all(&config_dir).expect("create config dir");
-    let config_path = config_dir.join("config.json");
-    fs::write(&config_path, r#"{"version":1}"#).expect("seed original config");
+    // Seed current DB with a provider so pre-import backup is meaningful.
+    let mut config = MultiAppConfig::default();
+    {
+        let manager = config
+            .get_manager_mut(&AppType::Claude)
+            .expect("claude manager");
+        manager.current = "p-old".to_string();
+        manager.providers.insert(
+            "p-old".to_string(),
+            Provider::with_id(
+                "p-old".to_string(),
+                "Old Claude".to_string(),
+                json!({
+                    "env": { "ANTHROPIC_AUTH_TOKEN": "old-key" }
+                }),
+                None,
+            ),
+        );
+    }
+    let app_state = state_from_config(config);
+    app_state.save().expect("persist initial db");
 
-    let import_payload = serde_json::json!({
-        "version": 2,
-        "claude": {
-            "providers": {
-                "p-new": {
-                    "id": "p-new",
-                    "name": "Test Claude",
-                    "settingsConfig": {
-                        "env": { "ANTHROPIC_API_KEY": "new-key" }
-                    }
-                }
-            },
-            "current": "p-new"
-        },
-        "codex": {
-            "providers": {},
-            "current": ""
-        },
-        "mcp": {
-            "claude": { "servers": {} },
-            "codex": { "servers": {} }
-        }
-    });
-
-    let import_path = config_dir.join("import.json");
-    fs::write(
-        &import_path,
-        serde_json::to_string_pretty(&import_payload).expect("serialize import payload"),
-    )
-    .expect("write import file");
-
-    let app_state = AppState {
-        config: RwLock::new(MultiAppConfig::default()),
-    };
+    // Build an import SQL file using an in-memory database.
+    let import_path = home.join(".cc-switch").join("import.sql");
+    let import_db = Database::memory().expect("create import db");
+    let provider = Provider::with_id(
+        "p-new".to_string(),
+        "Test Claude".to_string(),
+        json!({
+            "env": { "ANTHROPIC_AUTH_TOKEN": "new-key" }
+        }),
+        None,
+    );
+    import_db
+        .save_provider(AppType::Claude.as_str(), &provider)
+        .expect("seed provider");
+    import_db
+        .set_current_provider(AppType::Claude.as_str(), "p-new")
+        .expect("seed current");
+    import_db
+        .export_sql(&import_path)
+        .expect("export import sql");
 
     let backup_id = ConfigService::import_config_from_path(&import_path, &app_state)
         .expect("import should succeed");
     assert!(
         !backup_id.is_empty(),
-        "expected backup id when original config exists"
+        "expected pre-import backup id when database exists"
     );
 
-    let backup_path = config_dir.join("backups").join(format!("{backup_id}.json"));
+    let backup_path = home
+        .join(".cc-switch")
+        .join("backups")
+        .join(format!("{backup_id}.sql"));
     assert!(
         backup_path.exists(),
         "backup file should exist at {}",
         backup_path.display()
     );
 
-    let updated_content = fs::read_to_string(&config_path).expect("read updated config");
-    let parsed: serde_json::Value =
-        serde_json::from_str(&updated_content).expect("parse updated config");
+    let current = app_state
+        .db
+        .get_current_provider(AppType::Claude.as_str())
+        .expect("read current provider from db");
     assert_eq!(
-        parsed
-            .get("claude")
-            .and_then(|c| c.get("current"))
-            .and_then(|c| c.as_str()),
+        current.as_deref(),
         Some("p-new"),
-        "saved config should record new current provider"
-    );
-
-    let guard = app_state.config.read().expect("lock state after import");
-    let claude_manager = guard
-        .get_manager(&AppType::Claude)
-        .expect("claude manager in state");
-    assert_eq!(
-        claude_manager.current, "p-new",
-        "state should reflect new current provider"
-    );
-    assert!(
-        claude_manager.providers.contains_key("p-new"),
-        "new provider should exist in state"
+        "db should be replaced by imported SQL"
     );
 }
 
 #[test]
 fn import_config_from_path_invalid_json_returns_error() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let home = ensure_test_home();
 
     let config_dir = home.join(".cc-switch");
     fs::create_dir_all(&config_dir).expect("create config dir");
 
-    let invalid_path = config_dir.join("broken.json");
-    fs::write(&invalid_path, "{ not-json ").expect("write invalid json");
+    let invalid_path = config_dir.join("broken.sql");
+    fs::write(&invalid_path, "SELECT 1;").expect("write invalid sql");
 
-    let app_state = AppState {
-        config: RwLock::new(MultiAppConfig::default()),
-    };
+    let app_state = state_from_config(MultiAppConfig::default());
 
     let err = ConfigService::import_config_from_path(&invalid_path, &app_state)
         .expect_err("import should fail");
     match err {
-        AppError::Json { .. } => {}
-        other => panic!("expected json error, got {other:?}"),
+        AppError::Localized { key, .. } => assert_eq!(key, "backup.sql.invalid_format"),
+        other => panic!("expected Localized invalid SQL error, got {other:?}"),
     }
 }
 
 #[test]
 fn import_config_from_path_missing_file_produces_io_error() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let _home = ensure_test_home();
 
-    let missing_path = Path::new("/nonexistent/import.json");
-    let app_state = AppState {
-        config: RwLock::new(MultiAppConfig::default()),
-    };
+    let missing_path = Path::new("/nonexistent/import.sql");
+    let app_state = state_from_config(MultiAppConfig::default());
 
     let err = ConfigService::import_config_from_path(missing_path, &app_state)
         .expect_err("import should fail for missing file");
     match err {
-        AppError::Io { .. } => {}
-        other => panic!("expected io error, got {other:?}"),
+        AppError::InvalidInput(_) => {}
+        other => panic!("expected invalid input error, got {other:?}"),
     }
 }
 
 #[test]
 fn sync_gemini_packycode_sets_security_selected_type() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let home = ensure_test_home();
 
@@ -992,7 +1009,7 @@ fn sync_gemini_packycode_sets_security_selected_type() {
 
 #[test]
 fn sync_gemini_google_official_sets_oauth_security() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let home = ensure_test_home();
 
@@ -1058,16 +1075,33 @@ fn sync_gemini_google_official_sets_oauth_security() {
 
 #[test]
 fn export_config_to_file_writes_target_path() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let home = ensure_test_home();
 
-    let config_dir = home.join(".cc-switch");
-    fs::create_dir_all(&config_dir).expect("create config dir");
-    let config_path = config_dir.join("config.json");
-    fs::write(&config_path, r#"{"version":42,"flag":true}"#).expect("write config");
+    // Seed DB with data so export includes at least one known id.
+    let mut config = MultiAppConfig::default();
+    {
+        let manager = config
+            .get_manager_mut(&AppType::Claude)
+            .expect("claude manager");
+        manager.current = "p1".to_string();
+        manager.providers.insert(
+            "p1".to_string(),
+            Provider::with_id(
+                "p1".to_string(),
+                "Test Claude".to_string(),
+                json!({
+                    "env": { "ANTHROPIC_AUTH_TOKEN": "test-key" }
+                }),
+                None,
+            ),
+        );
+    }
+    let state = state_from_config(config);
+    state.save().expect("persist db");
 
-    let export_path = home.join("exported-config.json");
+    let export_path = home.join("exported-config.sql");
     if export_path.exists() {
         fs::remove_file(&export_path).expect("cleanup export target");
     }
@@ -1080,28 +1114,24 @@ fn export_config_to_file_writes_target_path() {
 
     let exported = fs::read_to_string(&export_path).expect("read exported file");
     assert!(
-        exported.contains(r#""version":42"#) && exported.contains(r#""flag":true"#),
-        "exported file should mirror source config content"
+        exported.starts_with("-- CC Switch SQLite 导出"),
+        "exported file should be a CC Switch SQL export"
+    );
+    assert!(
+        exported.contains("p1"),
+        "exported SQL should contain seeded provider data"
     );
 }
 
 #[test]
-fn export_config_to_file_returns_error_when_source_missing() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+fn export_config_to_file_returns_error_when_path_invalid() {
+    let _guard = lock_test_mutex();
     reset_test_fs();
-    let home = ensure_test_home();
 
-    let export_path = home.join("export-missing.json");
-    if export_path.exists() {
-        fs::remove_file(&export_path).expect("cleanup export target");
-    }
-
-    let err = block_on(cc_switch_lib::export_config_to_file(
-        export_path.to_string_lossy().to_string(),
-    ))
-    .expect_err("export should fail when config.json missing");
+    let err = block_on(cc_switch_lib::export_config_to_file(String::new()))
+        .expect_err("export should fail");
     assert!(
-        err.contains("IO 错误"),
-        "expected IO error message, got {err}"
+        err.contains("Invalid export path"),
+        "expected invalid export path message, got {err}"
     );
 }

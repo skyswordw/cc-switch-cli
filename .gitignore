@@ -1,6 +1,8 @@
 node_modules/
 dist/
 release/
+.upstream/
+.tmp/
 .DS_Store
 *.log
 .env

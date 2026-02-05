@@ -55,6 +55,7 @@ toml_edit = "0.22"
 serde_yaml = "0.9"
 base64 = "0.22"
 indexmap = { version = "2", features = ["serde"] }
+rusqlite = { version = "0.31", features = ["bundled", "backup"] }
 
 # Network and async
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

@@ -2559,12 +2559,6 @@ fn visible_skills_repos<'a>(
                 repo.owner.to_lowercase().contains(q)
                     || repo.name.to_lowercase().contains(q)
                     || repo.branch.to_lowercase().contains(q)
-                    || repo
-                        .skills_path
-                        .as_deref()
-                        .unwrap_or_default()
-                        .to_lowercase()
-                        .contains(q)
             }
         })
         .collect()

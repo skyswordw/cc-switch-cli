@@ -1,15 +1,14 @@
 use serde_json::json;
 use std::collections::HashMap;
-use std::sync::RwLock;
 
 use cc_switch_lib::{
-    get_claude_settings_path, read_json_file, write_codex_live_atomic, AppError, AppState, AppType,
-    McpApps, McpServer, MultiAppConfig, Provider, ProviderMeta, ProviderService,
+    get_claude_settings_path, read_json_file, write_codex_live_atomic, AppError, AppType, McpApps,
+    McpServer, MultiAppConfig, Provider, ProviderMeta, ProviderService,
 };
 
 #[path = "support.rs"]
 mod support;
-use support::{ensure_test_home, reset_test_fs, test_mutex};
+use support::{ensure_test_home, lock_test_mutex, reset_test_fs, state_from_config};
 
 fn sanitize_provider_name(name: &str) -> String {
     name.chars()
@@ -23,7 +22,7 @@ fn sanitize_provider_name(name: &str) -> String {
 
 #[test]
 fn provider_service_switch_codex_updates_live_and_config() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let _home = ensure_test_home();
 
@@ -85,6 +84,7 @@ command = "say"
                 claude: false,
                 codex: true,
                 gemini: false,
+                opencode: false,
             },
             description: None,
             homepage: None,
@@ -93,9 +93,7 @@ command = "say"
         },
     );
 
-    let state = AppState {
-        config: RwLock::new(initial_config),
-    };
+    let state = state_from_config(initial_config);
 
     ProviderService::switch(&state, AppType::Codex, "new-provider")
         .expect("switch provider should succeed");
@@ -157,7 +155,7 @@ command = "say"
 
 #[test]
 fn switch_gemini_when_uninitialized_skips_live_sync_and_succeeds() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let home = ensure_test_home();
 
@@ -204,9 +202,7 @@ fn switch_gemini_when_uninitialized_skips_live_sync_and_succeeds() {
         );
     }
 
-    let state = AppState {
-        config: RwLock::new(config),
-    };
+    let state = state_from_config(config);
 
     ProviderService::switch(&state, AppType::Gemini, "new-provider")
         .expect("switch should succeed even when Gemini is uninitialized");
@@ -225,7 +221,7 @@ fn switch_gemini_when_uninitialized_skips_live_sync_and_succeeds() {
 
 #[test]
 fn switch_packycode_gemini_updates_security_selected_type() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let home = ensure_test_home();
 
@@ -251,9 +247,7 @@ fn switch_packycode_gemini_updates_security_selected_type() {
         );
     }
 
-    let state = AppState {
-        config: RwLock::new(config),
-    };
+    let state = state_from_config(config);
 
     ProviderService::switch(&state, AppType::Gemini, "packy-gemini")
         .expect("switching to PackyCode Gemini should succeed");
@@ -279,7 +273,7 @@ fn switch_packycode_gemini_updates_security_selected_type() {
 
 #[test]
 fn packycode_partner_meta_triggers_security_flag_even_without_keywords() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let home = ensure_test_home();
 
@@ -307,9 +301,7 @@ fn packycode_partner_meta_triggers_security_flag_even_without_keywords() {
         manager.providers.insert("packy-meta".to_string(), provider);
     }
 
-    let state = AppState {
-        config: RwLock::new(config),
-    };
+    let state = state_from_config(config);
 
     ProviderService::switch(&state, AppType::Gemini, "packy-meta")
         .expect("switching to partner meta provider should succeed");
@@ -335,7 +327,7 @@ fn packycode_partner_meta_triggers_security_flag_even_without_keywords() {
 
 #[test]
 fn switch_google_official_gemini_sets_oauth_security() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let home = ensure_test_home();
     std::fs::create_dir_all(home.join(".gemini")).expect("create gemini dir (initialized)");
@@ -363,9 +355,7 @@ fn switch_google_official_gemini_sets_oauth_security() {
             .insert("google-official".to_string(), provider);
     }
 
-    let state = AppState {
-        config: RwLock::new(config),
-    };
+    let state = state_from_config(config);
 
     ProviderService::switch(&state, AppType::Gemini, "google-official")
         .expect("switching to Google official Gemini should succeed");
@@ -408,7 +398,7 @@ fn switch_google_official_gemini_sets_oauth_security() {
 
 #[test]
 fn switch_gemini_merges_existing_settings_preserving_mcp_servers() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let home = ensure_test_home();
 
@@ -468,9 +458,7 @@ fn switch_gemini_merges_existing_settings_preserving_mcp_servers() {
         );
     }
 
-    let state = AppState {
-        config: RwLock::new(config),
-    };
+    let state = state_from_config(config);
 
     ProviderService::switch(&state, AppType::Gemini, "new")
         .expect("switching to new gemini provider should succeed");
@@ -494,7 +482,7 @@ fn switch_gemini_merges_existing_settings_preserving_mcp_servers() {
 
 #[test]
 fn provider_service_switch_claude_updates_live_and_state() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let _home = ensure_test_home();
 
@@ -547,9 +535,7 @@ fn provider_service_switch_claude_updates_live_and_state() {
         );
     }
 
-    let state = AppState {
-        config: RwLock::new(config),
-    };
+    let state = state_from_config(config);
 
     ProviderService::switch(&state, AppType::Claude, "new-provider")
         .expect("switch provider should succeed");
@@ -586,9 +572,11 @@ fn provider_service_switch_claude_updates_live_and_state() {
 
 #[test]
 fn provider_service_switch_missing_provider_returns_error() {
-    let state = AppState {
-        config: RwLock::new(MultiAppConfig::default()),
-    };
+    let _guard = lock_test_mutex();
+    reset_test_fs();
+    ensure_test_home();
+
+    let state = state_from_config(MultiAppConfig::default());
 
     let err = ProviderService::switch(&state, AppType::Claude, "missing")
         .expect_err("switching missing provider should fail");
@@ -600,7 +588,7 @@ fn provider_service_switch_missing_provider_returns_error() {
 
 #[test]
 fn provider_service_switch_codex_missing_auth_is_allowed() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let _home = ensure_test_home();
     if let Some(parent) = cc_switch_lib::get_codex_config_path().parent() {
@@ -625,9 +613,7 @@ fn provider_service_switch_codex_missing_auth_is_allowed() {
         );
     }
 
-    let state = AppState {
-        config: RwLock::new(config),
-    };
+    let state = state_from_config(config);
 
     ProviderService::switch(&state, AppType::Codex, "invalid")
         .expect("switching should succeed without auth.json for Codex 0.64+");
@@ -644,7 +630,7 @@ fn provider_service_switch_codex_missing_auth_is_allowed() {
 
 #[test]
 fn provider_service_delete_codex_removes_provider_and_files() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let home = ensure_test_home();
 
@@ -688,9 +674,7 @@ fn provider_service_delete_codex_removes_provider_and_files() {
     std::fs::write(&auth_path, "{}").expect("seed auth file");
     std::fs::write(&cfg_path, "base_url = \"https://example\"").expect("seed config file");
 
-    let app_state = AppState {
-        config: RwLock::new(config),
-    };
+    let app_state = state_from_config(config);
 
     ProviderService::delete(&app_state, AppType::Codex, "to-delete")
         .expect("delete provider should succeed");
@@ -709,7 +693,7 @@ fn provider_service_delete_codex_removes_provider_and_files() {
 
 #[test]
 fn provider_service_delete_claude_removes_provider_files() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let home = ensure_test_home();
 
@@ -751,9 +735,7 @@ fn provider_service_delete_claude_removes_provider_files() {
     std::fs::write(&by_name, "{}").expect("seed settings by name");
     std::fs::write(&by_id, "{}").expect("seed settings by id");
 
-    let app_state = AppState {
-        config: RwLock::new(config),
-    };
+    let app_state = state_from_config(config);
 
     ProviderService::delete(&app_state, AppType::Claude, "delete").expect("delete claude provider");
 
@@ -773,6 +755,10 @@ fn provider_service_delete_claude_removes_provider_files() {
 
 #[test]
 fn provider_service_delete_current_provider_returns_error() {
+    let _guard = lock_test_mutex();
+    reset_test_fs();
+    ensure_test_home();
+
     let mut config = MultiAppConfig::default();
     {
         let manager = config
@@ -792,9 +778,7 @@ fn provider_service_delete_current_provider_returns_error() {
         );
     }
 
-    let app_state = AppState {
-        config: RwLock::new(config),
-    };
+    let app_state = state_from_config(config);
 
     let err = ProviderService::delete(&app_state, AppType::Claude, "keep")
         .expect_err("deleting current provider should fail");

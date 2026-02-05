@@ -1,9 +1,8 @@
 use clap::Subcommand;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
 
-use crate::app_config::{AppType, MultiAppConfig};
+use crate::app_config::AppType;
 use crate::cli::i18n::texts;
 use crate::cli::ui::{error, highlight, info, success, to_json};
 use crate::error::AppError;
@@ -95,10 +94,7 @@ pub fn execute(cmd: ConfigCommand, app: Option<AppType>) -> Result<(), AppError>
 }
 
 fn get_state() -> Result<AppState, AppError> {
-    let config = MultiAppConfig::load()?;
-    Ok(AppState {
-        config: RwLock::new(config),
-    })
+    AppState::try_new()
 }
 
 fn show_config() -> Result<(), AppError> {
@@ -179,8 +175,8 @@ fn set_common(
     {
         let mut config = state.config.write()?;
         config.common_config_snippets.set(&app_type, Some(pretty));
-        config.save()?;
     }
+    state.save()?;
 
     println!(
         "{}",
@@ -204,8 +200,8 @@ fn clear_common(app_type: AppType, apply: bool) -> Result<(), AppError> {
     {
         let mut config = state.config.write()?;
         config.common_config_snippets.set(&app_type, None);
-        config.save()?;
     }
+    state.save()?;
 
     println!(
         "{}",
@@ -242,25 +238,27 @@ fn apply_common_to_current(state: &AppState, app_type: AppType) -> Result<(), Ap
 }
 
 fn show_path() -> Result<(), AppError> {
-    let config_path = crate::config::get_app_config_path();
     let config_dir = crate::config::get_app_config_dir();
+    let db_path = config_dir.join("cc-switch.db");
+    let legacy_config_path = config_dir.join("config.json");
 
     println!("{}", highlight("Configuration Paths"));
     println!("{}", "=".repeat(50));
-    println!("Config file:  {}", config_path.display());
+    println!("DB file:      {}", db_path.display());
+    println!("Legacy JSON:  {}", legacy_config_path.display());
     println!("Config dir:   {}", config_dir.display());
 
-    // Check if config file exists
-    if config_path.exists() {
-        println!("\n{} Configuration file exists", success("✓"));
+    // Check if DB file exists
+    if db_path.exists() {
+        println!("\n{} Database exists", success("✓"));
 
         // Show file size
-        if let Ok(metadata) = fs::metadata(&config_path) {
+        if let Ok(metadata) = fs::metadata(&db_path) {
             println!("File size:    {} bytes", metadata.len());
         }
     } else {
-        println!("\n{} Configuration file does not exist", error("✗"));
-        println!("{}", info("Run cc-switch to create default configuration."));
+        println!("\n{} Database file does not exist", error("✗"));
+        println!("{}", info("Run cc-switch once to create the database."));
     }
 
     // Show backup directory
@@ -331,15 +329,10 @@ fn import_config(file: &PathBuf) -> Result<(), AppError> {
         )));
     }
 
-    // Validate the file is valid JSON
-    let content = fs::read_to_string(file).map_err(|e| AppError::io(file, e))?;
-    let _: MultiAppConfig = serde_json::from_str(&content)
-        .map_err(|e| AppError::Message(format!("Invalid configuration file: {}", e)))?;
-
     // Confirm import
     println!();
     println!("{}", highlight("Warning:"));
-    println!("This will replace your current configuration with the imported one.");
+    println!("This will replace your current database with the imported SQL backup.");
     println!("A backup will be created automatically.");
     println!();
 
@@ -376,12 +369,6 @@ fn import_config(file: &PathBuf) -> Result<(), AppError> {
 fn backup_config(custom_name: Option<&str>) -> Result<(), AppError> {
     let config_path = crate::config::get_app_config_path();
 
-    if !config_path.exists() {
-        println!("{}", error("Configuration file does not exist."));
-        println!("{}", info("Nothing to backup."));
-        return Ok(());
-    }
-
     if let Some(name) = custom_name {
         println!(
             "{}",
@@ -397,7 +384,7 @@ fn backup_config(custom_name: Option<&str>) -> Result<(), AppError> {
         println!("{}", error("Failed to create backup."));
     } else {
         let backup_dir = config_path.parent().unwrap().join("backups");
-        let backup_file = backup_dir.join(format!("{}.json", backup_id));
+        let backup_file = backup_dir.join(format!("{}.sql", backup_id));
 
         println!("{}", success(&format!("✓ Backup created: {}", backup_id)));
         println!("Location: {}", backup_file.display());
@@ -463,13 +450,9 @@ fn restore_config(backup_id: Option<&str>, file_path: Option<&Path>) -> Result<(
             )));
         }
 
-        let content = fs::read_to_string(file).map_err(|e| AppError::io(file, e))?;
-        let _: MultiAppConfig = serde_json::from_str(&content)
-            .map_err(|e| AppError::Message(format!("Invalid configuration file: {}", e)))?;
-
         println!();
         println!("{}", highlight("Warning:"));
-        println!("This will replace your current configuration with the file.");
+        println!("This will replace your current database with the SQL backup file.");
         println!("A backup of the current state will be created first.");
         println!();
 
@@ -483,9 +466,8 @@ fn restore_config(backup_id: Option<&str>, file_path: Option<&Path>) -> Result<(
             return Ok(());
         }
 
-        let pre_restore_backup = ConfigService::create_backup(&config_path, None)?;
         let state = get_state()?;
-        let _ = ConfigService::import_config_from_path(file, &state)?;
+        let pre_restore_backup = ConfigService::import_config_from_path(file, &state)?;
 
         println!(
             "{}",
@@ -579,57 +561,41 @@ fn restore_config(backup_id: Option<&str>, file_path: Option<&Path>) -> Result<(
 }
 
 fn validate_config() -> Result<(), AppError> {
-    let config_path = crate::config::get_app_config_path();
+    let config_dir = crate::config::get_app_config_dir();
+    let db_path = config_dir.join("cc-switch.db");
 
-    println!("{}", info("Validating configuration..."));
+    println!("{}", info("Validating database..."));
     println!();
 
-    // Check if file exists
-    if !config_path.exists() {
-        println!("{}", error("✗ Configuration file does not exist"));
-        println!("Path: {}", config_path.display());
+    if !db_path.exists() {
+        println!("{}", error("✗ Database file does not exist"));
+        println!("Path: {}", db_path.display());
         return Ok(());
     }
 
-    println!("{} Configuration file exists", success("✓"));
-    println!("Path: {}", config_path.display());
+    println!("{} Database file exists", success("✓"));
+    println!("Path: {}", db_path.display());
 
-    // Try to load and parse the configuration
-    match MultiAppConfig::load() {
-        Ok(config) => {
-            println!("{} Configuration is valid JSON", success("✓"));
+    let db = crate::Database::init()?;
+    println!("{} Database schema is readable", success("✓"));
 
-            // Show some stats
-            let claude_count = config
-                .get_manager(&crate::app_config::AppType::Claude)
-                .map(|m| m.providers.len())
-                .unwrap_or(0);
-            let codex_count = config
-                .get_manager(&crate::app_config::AppType::Codex)
-                .map(|m| m.providers.len())
-                .unwrap_or(0);
-            let gemini_count = config
-                .get_manager(&crate::app_config::AppType::Gemini)
-                .map(|m| m.providers.len())
-                .unwrap_or(0);
-            let mcp_count = config.mcp.servers.as_ref().map(|s| s.len()).unwrap_or(0);
+    // Show some stats
+    let claude_count = db.get_all_providers("claude")?.len();
+    let codex_count = db.get_all_providers("codex")?.len();
+    let gemini_count = db.get_all_providers("gemini")?.len();
+    let mcp_count = db.get_all_mcp_servers()?.len();
+    let skills_count = db.get_all_installed_skills()?.len();
 
-            println!();
-            println!("{}", highlight("Configuration Summary:"));
-            println!("Claude providers:  {}", claude_count);
-            println!("Codex providers:   {}", codex_count);
-            println!("Gemini providers:  {}", gemini_count);
-            println!("MCP servers:       {}", mcp_count);
+    println!();
+    println!("{}", highlight("Database Summary:"));
+    println!("Claude providers:  {}", claude_count);
+    println!("Codex providers:   {}", codex_count);
+    println!("Gemini providers:  {}", gemini_count);
+    println!("MCP servers:       {}", mcp_count);
+    println!("Skills installed:  {}", skills_count);
 
-            println!();
-            println!("{}", success("✓ Configuration validation passed"));
-        }
-        Err(e) => {
-            println!("{} Configuration parsing failed", error("✗"));
-            println!("Error: {}", e);
-            return Err(e);
-        }
-    }
+    println!();
+    println!("{}", success("✓ Database validation passed"));
 
     Ok(())
 }
@@ -656,17 +622,18 @@ fn reset_config() -> Result<(), AppError> {
         return Ok(());
     }
 
-    // Create a backup before reset
+    // Create a backup before reset (SQL)
     let config_path = crate::config::get_app_config_path();
     let backup_id = ConfigService::create_backup(&config_path, None)?;
 
-    // Delete the current config file
-    if config_path.exists() {
-        fs::remove_file(&config_path).map_err(|e| AppError::io(&config_path, e))?;
+    // Delete the database file
+    let db_path = crate::config::get_app_config_dir().join("cc-switch.db");
+    if db_path.exists() {
+        fs::remove_file(&db_path).map_err(|e| AppError::io(&db_path, e))?;
     }
 
-    // Force reload will create a new default config
-    let _ = MultiAppConfig::load()?;
+    // Recreate empty DB
+    let _ = crate::Database::init()?;
 
     println!("{}", success("✓ Configuration reset to defaults"));
     if !backup_id.is_empty() {

@@ -1,14 +1,12 @@
-use crate::config::get_app_config_path;
 use crate::error::AppError;
+use crate::Database;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-/// Export `~/.cc-switch/config.json` to the given file path.
+/// Export the SQLite database to a CC Switch compatible SQL file.
 ///
-/// This mirrors the upstream Tauri command signature style (`Result<Value, String>`)
-/// while keeping the CLI project JSON SSOT model.
+/// This mirrors the upstream command signature style (`Result<Value, String>`).
 pub async fn export_config_to_file(file_path: String) -> Result<Value, String> {
-    let source_path = get_app_config_path();
     let target_path = PathBuf::from(&file_path);
 
     let Some(parent) = target_path.parent() else {
@@ -20,13 +18,12 @@ pub async fn export_config_to_file(file_path: String) -> Result<Value, String> {
         std::fs::create_dir_all(parent).map_err(|e| AppError::io(parent, e).to_string())?;
     }
 
-    let bytes =
-        std::fs::read(&source_path).map_err(|e| AppError::io(&source_path, e).to_string())?;
-    std::fs::write(&target_path, bytes).map_err(|e| AppError::io(&target_path, e).to_string())?;
+    let db = Database::init().map_err(|e| e.to_string())?;
+    db.export_sql(&target_path).map_err(|e| e.to_string())?;
 
     Ok(json!({
         "success": true,
-        "message": "Config exported successfully",
+        "message": "SQL exported successfully",
         "filePath": file_path
     }))
 }

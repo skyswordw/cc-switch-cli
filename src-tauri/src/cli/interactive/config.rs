@@ -1,7 +1,7 @@
 use inquire::{Confirm, Text};
 use std::path::Path;
 
-use crate::app_config::{AppType, MultiAppConfig};
+use crate::app_config::AppType;
 use crate::cli::i18n::texts;
 use crate::cli::ui::{error, highlight, info, success};
 use crate::config::get_app_config_path;
@@ -217,23 +217,25 @@ fn open_external_editor(initial_content: &str) -> Result<String, AppError> {
 
 fn show_config_path_interactive() -> Result<(), AppError> {
     clear_screen();
-    let config_path = get_app_config_path();
-    let config_dir = config_path.parent().unwrap_or(&config_path);
+    let config_dir = crate::config::get_app_config_dir();
+    let db_path = config_dir.join("cc-switch.db");
+    let legacy_config_path = get_app_config_path();
 
     println!(
         "\n{}",
         highlight(texts::config_show_path().trim_start_matches("📍 "))
     );
     println!("{}", texts::tui_rule(60));
-    println!("Config file: {}", config_path.display());
-    println!("Config dir:  {}", config_dir.display());
+    println!("DB file:      {}", db_path.display());
+    println!("Legacy JSON:  {}", legacy_config_path.display());
+    println!("Config dir:   {}", config_dir.display());
 
-    if config_path.exists() {
-        if let Ok(metadata) = std::fs::metadata(&config_path) {
+    if db_path.exists() {
+        if let Ok(metadata) = std::fs::metadata(&db_path) {
             println!("File size:   {} bytes", metadata.len());
         }
     } else {
-        println!("Status:      File does not exist");
+        println!("Status:      Database file does not exist");
     }
 
     let backup_dir = config_dir.join("backups");
@@ -250,8 +252,9 @@ fn show_config_path_interactive() -> Result<(), AppError> {
 
 fn show_full_config_interactive() -> Result<(), AppError> {
     clear_screen();
-    let config = MultiAppConfig::load()?;
-    let json = serde_json::to_string_pretty(&config)
+    let state = get_state()?;
+    let config = state.config.read()?;
+    let json = serde_json::to_string_pretty(&*config)
         .map_err(|e| AppError::Message(format!("Failed to serialize config: {}", e)))?;
 
     println!(
@@ -444,7 +447,8 @@ fn restore_config_interactive() -> Result<(), AppError> {
 
 fn validate_config_interactive() -> Result<(), AppError> {
     clear_screen();
-    let config_path = get_app_config_path();
+    let config_dir = crate::config::get_app_config_dir();
+    let db_path = config_dir.join("cc-switch.db");
 
     println!(
         "\n{}",
@@ -452,46 +456,27 @@ fn validate_config_interactive() -> Result<(), AppError> {
     );
     println!("{}", texts::tui_rule(60));
 
-    if !config_path.exists() {
+    if !db_path.exists() {
         return Err(AppError::Message(
             texts::tui_toast_config_file_does_not_exist().to_string(),
         ));
     }
 
-    let content = std::fs::read_to_string(&config_path)
-        .map_err(|e| AppError::Message(texts::tui_error_failed_to_read_config(&e.to_string())))?;
-
-    let _: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|e| AppError::Message(texts::tui_toast_invalid_json(&e.to_string())))?;
-
-    let config: MultiAppConfig = serde_json::from_str(&content).map_err(|e| {
-        AppError::Message(texts::tui_error_invalid_config_structure(&e.to_string()))
-    })?;
+    let db = crate::Database::init()?;
+    let claude_count = db.get_all_providers("claude")?.len();
+    let codex_count = db.get_all_providers("codex")?.len();
+    let gemini_count = db.get_all_providers("gemini")?.len();
+    let mcp_count = db.get_all_mcp_servers()?.len();
+    let skills_count = db.get_all_installed_skills()?.len();
 
     println!("{}", success(texts::config_valid()));
     println!();
-
-    let claude_count = config
-        .apps
-        .get("claude")
-        .map(|m| m.providers.len())
-        .unwrap_or(0);
-    let codex_count = config
-        .apps
-        .get("codex")
-        .map(|m| m.providers.len())
-        .unwrap_or(0);
-    let gemini_count = config
-        .apps
-        .get("gemini")
-        .map(|m| m.providers.len())
-        .unwrap_or(0);
-    let mcp_count = config.mcp.servers.as_ref().map(|s| s.len()).unwrap_or(0);
 
     println!("Claude providers: {}", claude_count);
     println!("Codex providers:  {}", codex_count);
     println!("Gemini providers: {}", gemini_count);
     println!("MCP servers:      {}", mcp_count);
+    println!("Skills installed: {}", skills_count);
 
     pause();
     Ok(())
@@ -509,22 +494,24 @@ fn reset_config_interactive() -> Result<(), AppError> {
         return Ok(());
     }
 
-    let config_path = get_app_config_path();
+    let config_dir = crate::config::get_app_config_dir();
+    let db_path = config_dir.join("cc-switch.db");
 
-    let backup_id = ConfigService::create_backup(&config_path, None)?;
+    let backup_id = ConfigService::create_backup(&db_path, None)?;
 
-    if config_path.exists() {
-        std::fs::remove_file(&config_path)
-            .map_err(|e| AppError::Message(format!("Failed to delete config: {}", e)))?;
+    if db_path.exists() {
+        std::fs::remove_file(&db_path).map_err(|e| AppError::io(&db_path, e))?;
     }
 
-    let _ = MultiAppConfig::load()?;
+    let _ = crate::Database::init()?;
 
     println!("\n{}", success(texts::config_reset_done()));
-    println!(
-        "{}",
-        info(&format!("Previous config backed up: {}", backup_id))
-    );
+    if !backup_id.is_empty() {
+        println!(
+            "{}",
+            info(&format!("Previous config backed up: {}", backup_id))
+        );
+    }
     pause();
     Ok(())
 }

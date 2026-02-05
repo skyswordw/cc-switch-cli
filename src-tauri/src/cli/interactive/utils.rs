@@ -1,11 +1,9 @@
 use std::io::{self, IsTerminal, Write};
-use std::sync::RwLock;
 
 use inquire::error::InquireError;
 use inquire::{Confirm, MultiSelect, Select, Text};
 
 use crate::app_config::AppType;
-use crate::app_config::MultiAppConfig;
 use crate::cli::i18n::texts;
 use crate::error::AppError;
 use crate::store::AppState;
@@ -36,10 +34,7 @@ pub fn app_switch_direction_from_key(key: &console::Key) -> Option<AppSwitchDire
 }
 
 pub fn get_state() -> Result<AppState, AppError> {
-    let config = MultiAppConfig::load()?;
-    Ok(AppState {
-        config: RwLock::new(config),
-    })
+    AppState::try_new()
 }
 
 pub fn clear_screen() {

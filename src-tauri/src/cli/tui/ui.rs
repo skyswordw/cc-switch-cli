@@ -760,12 +760,6 @@ fn render_skills_repos(
                 repo.owner.to_lowercase().contains(q)
                     || repo.name.to_lowercase().contains(q)
                     || repo.branch.to_lowercase().contains(q)
-                    || repo
-                        .skills_path
-                        .as_deref()
-                        .unwrap_or_default()
-                        .to_lowercase()
-                        .contains(q)
             }
         })
         .collect::<Vec<_>>();
@@ -785,7 +779,6 @@ fn render_skills_repos(
         Cell::from(""),
         Cell::from(texts::tui_header_repo()),
         Cell::from(texts::tui_header_branch()),
-        Cell::from(texts::tui_header_path()),
     ])
     .style(header_style);
 
@@ -795,7 +788,6 @@ fn render_skills_repos(
             Cell::from(if repo.enabled { "✓" } else { " " }),
             Cell::from(repo_name),
             Cell::from(repo.branch.clone()),
-            Cell::from(repo.skills_path.as_deref().unwrap_or("-")),
         ])
     });
 
@@ -803,9 +795,8 @@ fn render_skills_repos(
         rows,
         [
             Constraint::Length(2),
-            Constraint::Percentage(45),
-            Constraint::Percentage(20),
-            Constraint::Percentage(35),
+            Constraint::Percentage(70),
+            Constraint::Percentage(30),
         ],
     )
     .header(header)
@@ -3291,6 +3282,7 @@ mod tests {
                 claude: true,
                 codex: false,
                 gemini: false,
+                opencode: false,
             },
             installed_at: 1,
         }
@@ -3484,7 +3476,6 @@ mod tests {
             name: "skills".to_string(),
             branch: "main".to_string(),
             enabled: true,
-            skills_path: None,
         }];
 
         let buf = render(&app, &data);

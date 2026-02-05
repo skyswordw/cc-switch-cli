@@ -23,6 +23,14 @@ use live::LiveSnapshot;
 /// 供应商相关业务逻辑
 pub struct ProviderService;
 
+#[cfg(test)]
+fn state_from_config(config: MultiAppConfig) -> AppState {
+    AppState {
+        db: std::sync::Arc::new(crate::Database::memory().expect("create memory database")),
+        config: std::sync::RwLock::new(config),
+    }
+}
+
 /// 从供应商名称生成 Codex 的 provider ID (lowercase alphanumeric)
 /// 示例: "Duck Coding" -> "duckcoding"
 fn generate_provider_id_from_name(name: &str) -> String {
@@ -48,7 +56,7 @@ mod tests {
     use serial_test::serial;
     use std::ffi::OsString;
     use std::path::Path;
-    use std::sync::RwLock;
+    use std::sync::{Arc, RwLock};
     use tempfile::TempDir;
 
     struct EnvGuard {
@@ -133,9 +141,7 @@ mod tests {
             );
         }
 
-        let state = AppState {
-            config: RwLock::new(config),
-        };
+        let state = state_from_config(config);
 
         ProviderService::switch(&state, AppType::Codex, "p1")
             .expect("switch should succeed without auth.json when using credential store");
@@ -213,9 +219,7 @@ mod tests {
             );
         }
 
-        let state = AppState {
-            config: RwLock::new(config),
-        };
+        let state = state_from_config(config);
 
         // Seed initial live config for p1, then switch to p2, then back to p1.
         ProviderService::switch(&state, AppType::Codex, "p1").expect("seed p1 live");
@@ -261,9 +265,7 @@ mod tests {
 
         let mut config = MultiAppConfig::default();
         config.ensure_app(&AppType::Claude);
-        let state = AppState {
-            config: RwLock::new(config),
-        };
+        let state = state_from_config(config);
 
         let provider = Provider::with_id(
             "p1".to_string(),
@@ -331,9 +333,7 @@ mod tests {
             manager.providers.insert("p2".to_string(), p2);
         }
 
-        let state = AppState {
-            config: RwLock::new(config),
-        };
+        let state = state_from_config(config);
 
         let current_id =
             ProviderService::current(&state, AppType::Claude).expect("self-heal current provider");
@@ -365,9 +365,7 @@ mod tests {
                 .to_string(),
         );
 
-        let state = AppState {
-            config: RwLock::new(config),
-        };
+        let state = state_from_config(config);
 
         let provider = Provider::with_id(
             "p1".to_string(),
@@ -425,9 +423,7 @@ mod tests {
                 .to_string(),
         );
 
-        let state = AppState {
-            config: RwLock::new(config),
-        };
+        let state = state_from_config(config);
 
         let provider: Provider = serde_json::from_value(json!({
             "id": "p1",
@@ -482,9 +478,7 @@ mod tests {
                 .to_string(),
         );
 
-        let state = AppState {
-            config: RwLock::new(config),
-        };
+        let state = state_from_config(config);
 
         let p1 = Provider::with_id(
             "p1".to_string(),
@@ -554,9 +548,7 @@ mod tests {
         config.ensure_app(&AppType::Codex);
         config.common_config_snippets.codex = Some("disable_response_storage = true".to_string());
 
-        let state = AppState {
-            config: RwLock::new(config),
-        };
+        let state = state_from_config(config);
 
         let provider = Provider::with_id(
             "p1".to_string(),
@@ -609,9 +601,7 @@ mod tests {
             );
         }
 
-        let state = AppState {
-            config: RwLock::new(config),
-        };
+        let state = state_from_config(config);
 
         let config_toml = r#"model_provider = "azure"
 model = "gpt-4"
@@ -715,9 +705,7 @@ base_url = "http://localhost:8080"
             );
         }
 
-        let state = AppState {
-            config: RwLock::new(config),
-        };
+        let state = state_from_config(config);
 
         ProviderService::switch(&state, AppType::Codex, "p2").expect("switch should succeed");
 
@@ -835,9 +823,7 @@ base_url = "http://localhost:8080"
         config.common_config_snippets.gemini =
             Some(r#"{"env":{"CC_SWITCH_GEMINI_COMMON":"1"}}"#.to_string());
 
-        let state = AppState {
-            config: RwLock::new(config),
-        };
+        let state = state_from_config(config);
 
         let provider = Provider::with_id(
             "p1".to_string(),
@@ -876,9 +862,7 @@ base_url = "http://localhost:8080"
         config.common_config_snippets.gemini =
             Some(r#"{"env":{"CC_SWITCH_GEMINI_COMMON":"1"}}"#.to_string());
 
-        let state = AppState {
-            config: RwLock::new(config),
-        };
+        let state = state_from_config(config);
 
         let p1 = Provider::with_id(
             "p1".to_string(),
@@ -2716,9 +2700,7 @@ mod codex_openai_auth_tests {
             );
         }
 
-        let state = AppState {
-            config: RwLock::new(config),
-        };
+        let state = state_from_config(config);
         ProviderService::switch(&state, AppType::Codex, "p1").expect("switch should succeed");
 
         let config_text =

@@ -1,19 +1,18 @@
 use serde_json::json;
 use std::collections::HashMap;
-use std::sync::RwLock;
 
 use cc_switch_lib::{
-    get_codex_auth_path, get_codex_config_path, read_json_file, write_codex_live_atomic, AppState,
-    AppType, McpApps, McpServer, MultiAppConfig, Provider, ProviderService,
+    get_codex_auth_path, get_codex_config_path, read_json_file, write_codex_live_atomic, AppType,
+    McpApps, McpServer, MultiAppConfig, Provider, ProviderService,
 };
 
 #[path = "support.rs"]
 mod support;
-use support::{ensure_test_home, reset_test_fs, test_mutex};
+use support::{ensure_test_home, lock_test_mutex, reset_test_fs, state_from_config};
 
 #[test]
 fn switch_provider_updates_codex_live_and_state() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let _home = ensure_test_home();
 
@@ -75,6 +74,7 @@ command = "say"
                 claude: false,
                 codex: true,
                 gemini: false,
+                opencode: false,
             },
             description: None,
             homepage: None,
@@ -83,9 +83,7 @@ command = "say"
         },
     );
 
-    let app_state = AppState {
-        config: RwLock::new(config),
-    };
+    let app_state = state_from_config(config);
 
     ProviderService::switch(&app_state, AppType::Codex, "new-provider")
         .expect("switch provider should succeed");
@@ -149,7 +147,7 @@ command = "say"
 
 #[test]
 fn switch_provider_codex_accepts_full_config_toml_and_preserves_base_url() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     ensure_test_home();
 
@@ -190,9 +188,7 @@ requires_openai_auth = true
         );
     }
 
-    let state = AppState {
-        config: RwLock::new(config),
-    };
+    let state = state_from_config(config);
 
     ProviderService::switch(&state, AppType::Codex, "p1").expect("switch should succeed");
 
@@ -232,7 +228,7 @@ requires_openai_auth = true
 
 #[test]
 fn switch_provider_missing_provider_returns_error() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
 
     let mut config = MultiAppConfig::default();
@@ -241,9 +237,7 @@ fn switch_provider_missing_provider_returns_error() {
         .expect("claude manager")
         .current = "does-not-exist".to_string();
 
-    let app_state = AppState {
-        config: RwLock::new(config),
-    };
+    let app_state = state_from_config(config);
 
     let err = ProviderService::switch(&app_state, AppType::Claude, "missing-provider")
         .expect_err("switching to a missing provider should fail");
@@ -256,7 +250,7 @@ fn switch_provider_missing_provider_returns_error() {
 
 #[test]
 fn switch_provider_updates_claude_live_and_state() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let _home = ensure_test_home();
 
@@ -309,9 +303,7 @@ fn switch_provider_updates_claude_live_and_state() {
         );
     }
 
-    let app_state = AppState {
-        config: RwLock::new(config),
-    };
+    let app_state = state_from_config(config);
 
     ProviderService::switch(&app_state, AppType::Claude, "new-provider")
         .expect("switch provider should succeed");
@@ -358,30 +350,20 @@ fn switch_provider_updates_claude_live_and_state() {
 
     drop(locked);
 
-    let home_dir = std::env::var("HOME").expect("HOME should be set by ensure_test_home");
-    let config_path = std::path::Path::new(&home_dir)
-        .join(".cc-switch")
-        .join("config.json");
-    assert!(
-        config_path.exists(),
-        "switching provider should persist config.json"
-    );
-    let persisted: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read saved config"))
-            .expect("parse saved config");
+    let current = app_state
+        .db
+        .get_current_provider(AppType::Claude.as_str())
+        .expect("read current provider from db");
     assert_eq!(
-        persisted
-            .get("claude")
-            .and_then(|claude| claude.get("current"))
-            .and_then(|current| current.as_str()),
+        current.as_deref(),
         Some("new-provider"),
-        "saved config.json should record the new current provider"
+        "db should record the new current provider"
     );
 }
 
 #[test]
 fn switch_provider_codex_allows_missing_auth_and_writes_config() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let _home = ensure_test_home();
     if let Some(parent) = get_codex_config_path().parent() {
@@ -406,9 +388,7 @@ fn switch_provider_codex_allows_missing_auth_and_writes_config() {
         );
     }
 
-    let app_state = AppState {
-        config: RwLock::new(config),
-    };
+    let app_state = state_from_config(config);
 
     ProviderService::switch(&app_state, AppType::Codex, "invalid")
         .expect("switching should succeed without auth.json for Codex 0.64+");

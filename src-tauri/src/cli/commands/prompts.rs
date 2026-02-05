@@ -1,7 +1,6 @@
 use clap::Subcommand;
-use std::sync::RwLock;
 
-use crate::app_config::{AppType, MultiAppConfig};
+use crate::app_config::AppType;
 use crate::cli::ui::{create_table, highlight, info, success};
 use crate::error::AppError;
 use crate::prompt::Prompt;
@@ -56,10 +55,7 @@ pub fn execute(cmd: PromptsCommand, app: Option<AppType>) -> Result<(), AppError
 }
 
 fn get_state() -> Result<AppState, AppError> {
-    let config = MultiAppConfig::load()?;
-    Ok(AppState {
-        config: RwLock::new(config),
-    })
+    AppState::try_new()
 }
 
 fn list_prompts(app_type: AppType) -> Result<(), AppError> {

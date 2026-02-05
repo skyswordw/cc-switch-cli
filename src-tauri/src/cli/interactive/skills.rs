@@ -653,6 +653,5 @@ fn parse_repo_spec(raw: &str) -> Result<SkillRepo, AppError> {
         name: name.to_string(),
         branch: branch.unwrap_or("main").to_string(),
         enabled: true,
-        skills_path: None,
     })
 }

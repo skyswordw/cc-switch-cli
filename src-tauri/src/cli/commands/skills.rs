@@ -273,13 +273,12 @@ fn list_repos() -> Result<(), AppError> {
     }
 
     let mut table = create_table();
-    table.set_header(vec!["Enabled", "Repo", "Branch", "Skills Path"]);
+    table.set_header(vec!["Enabled", "Repo", "Branch"]);
     for repo in repos {
         table.add_row(vec![
             if repo.enabled { "✓" } else { " " }.to_string(),
             format!("{}/{}", repo.owner, repo.name),
             repo.branch,
-            repo.skills_path.unwrap_or_else(|| "-".to_string()),
         ]);
     }
     println!("{}", table);
@@ -351,6 +350,5 @@ fn parse_repo_spec(raw: &str) -> Result<SkillRepo, AppError> {
         name: name.to_string(),
         branch: branch.unwrap_or("main").to_string(),
         enabled: true,
-        skills_path: None,
     })
 }

@@ -383,7 +383,7 @@ pub mod texts {
     }
 
     pub fn tui_default_config_export_path() -> &'static str {
-        "./config-export.json"
+        "./config-export.sql"
     }
 
     pub fn tui_default_common_snippet() -> &'static str {

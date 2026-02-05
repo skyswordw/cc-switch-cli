@@ -1,19 +1,15 @@
-use std::sync::RwLock;
-
 use base64::prelude::*;
-use cc_switch_lib::{
-    import_provider_from_deeplink, parse_deeplink_url, AppState, AppType, MultiAppConfig,
-};
+use cc_switch_lib::{import_provider_from_deeplink, parse_deeplink_url, AppType, MultiAppConfig};
 
 #[path = "support.rs"]
 mod support;
-use support::{ensure_test_home, reset_test_fs, test_mutex};
+use support::{ensure_test_home, lock_test_mutex, reset_test_fs, state_from_config};
 
 #[test]
 fn deeplink_import_claude_provider_persists_to_config() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
-    let home = ensure_test_home();
+    let _home = ensure_test_home();
 
     let url = "ccswitch://v1/import?resource=provider&app=claude&name=DeepLink%20Claude&homepage=https%3A%2F%2Fexample.com&endpoint=https%3A%2F%2Fapi.example.com%2Fv1&apiKey=sk-test-claude-key&model=claude-sonnet-4";
     let request = parse_deeplink_url(url).expect("parse deeplink url");
@@ -21,9 +17,7 @@ fn deeplink_import_claude_provider_persists_to_config() {
     let mut config = MultiAppConfig::default();
     config.ensure_app(&AppType::Claude);
 
-    let state = AppState {
-        config: RwLock::new(config),
-    };
+    let state = state_from_config(config);
 
     let provider_id = import_provider_from_deeplink(&state, request.clone())
         .expect("import provider from deeplink");
@@ -56,18 +50,18 @@ fn deeplink_import_claude_provider_persists_to_config() {
     drop(guard);
 
     // 验证配置已持久化
-    let config_path = home.join(".cc-switch").join("config.json");
-    assert!(
-        config_path.exists(),
-        "importing provider from deeplink should persist config.json"
-    );
+    let persisted = state
+        .db
+        .get_provider_by_id(&provider_id, AppType::Claude.as_str())
+        .expect("read provider from db");
+    assert!(persisted.is_some(), "provider should be persisted to db");
 }
 
 #[test]
 fn deeplink_import_codex_provider_builds_auth_and_config() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
-    let home = ensure_test_home();
+    let _home = ensure_test_home();
 
     let url = "ccswitch://v1/import?resource=provider&app=codex&name=DeepLink%20Codex&homepage=https%3A%2F%2Fopenai.example&endpoint=https%3A%2F%2Fapi.openai.example%2Fv1&apiKey=sk-test-codex-key&model=gpt-4o";
     let request = parse_deeplink_url(url).expect("parse deeplink url");
@@ -75,9 +69,7 @@ fn deeplink_import_codex_provider_builds_auth_and_config() {
     let mut config = MultiAppConfig::default();
     config.ensure_app(&AppType::Codex);
 
-    let state = AppState {
-        config: RwLock::new(config),
-    };
+    let state = state_from_config(config);
 
     let provider_id = import_provider_from_deeplink(&state, request.clone())
         .expect("import provider from deeplink");
@@ -119,16 +111,16 @@ fn deeplink_import_codex_provider_builds_auth_and_config() {
     );
     drop(guard);
 
-    let config_path = home.join(".cc-switch").join("config.json");
-    assert!(
-        config_path.exists(),
-        "importing provider from deeplink should persist config.json"
-    );
+    let persisted = state
+        .db
+        .get_provider_by_id(&provider_id, AppType::Codex.as_str())
+        .expect("read provider from db");
+    assert!(persisted.is_some(), "provider should be persisted to db");
 }
 
 #[test]
 fn deeplink_import_rejects_non_http_endpoints_from_config() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     ensure_test_home();
 
@@ -144,9 +136,7 @@ fn deeplink_import_rejects_non_http_endpoints_from_config() {
     let mut config = MultiAppConfig::default();
     config.ensure_app(&AppType::Claude);
 
-    let state = AppState {
-        config: RwLock::new(config),
-    };
+    let state = state_from_config(config);
 
     let err = import_provider_from_deeplink(&state, request)
         .expect_err("non-http endpoints should be rejected");

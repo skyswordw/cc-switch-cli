@@ -1,7 +1,6 @@
 use clap::Subcommand;
-use std::sync::RwLock;
 
-use crate::app_config::{AppType, McpApps, McpServer, MultiAppConfig};
+use crate::app_config::{AppType, McpApps, McpServer};
 use crate::cli::ui::{create_table, error, highlight, info, success};
 use crate::error::AppError;
 use crate::services::McpService;
@@ -61,10 +60,7 @@ pub fn execute(cmd: McpCommand, app: Option<AppType>) -> Result<(), AppError> {
 }
 
 fn get_state() -> Result<AppState, AppError> {
-    let config = MultiAppConfig::load()?;
-    Ok(AppState {
-        config: RwLock::new(config),
-    })
+    AppState::try_new()
 }
 
 fn list_servers(app_type: AppType) -> Result<(), AppError> {

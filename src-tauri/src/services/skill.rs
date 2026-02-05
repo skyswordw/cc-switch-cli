@@ -1,9 +1,8 @@
 //! Skills service layer
 //!
-//! This aligns with upstream `cc-switch` v3.10+ "SSOT + sync" architecture, while keeping
-//! `cc-switch-cli` storage file-based (no DB for now):
-//! - SSOT directory: `~/.cc-switch/skills/`
-//! - Index/config: `~/.cc-switch/skills.json`
+//! v3.10.0+ 统一管理架构（与上游一致）：
+//! - SSOT（单一事实源）：`~/.cc-switch/skills/`
+//! - 数据库存储安装记录、启用状态与仓库列表（`~/.cc-switch/cc-switch.db`）
 
 use chrono::{DateTime, Utc};
 use futures::future::join_all;
@@ -15,17 +14,15 @@ use std::path::{Path, PathBuf};
 use tokio::time::timeout;
 
 use crate::app_config::AppType;
-use crate::config::{copy_file, get_app_config_dir, write_json_file};
+pub use crate::app_config::{InstalledSkill, SkillApps, UnmanagedSkill};
+use crate::config::get_app_config_dir;
+use crate::database::Database;
 use crate::error::{format_skill_error, AppError};
 
 const SKILLS_INDEX_VERSION: u32 = 1;
 
 fn default_skills_index_version() -> u32 {
     SKILLS_INDEX_VERSION
-}
-
-fn get_skills_store_path() -> PathBuf {
-    get_app_config_dir().join("skills.json")
 }
 
 // ============================================================================
@@ -43,9 +40,6 @@ pub struct SkillRepo {
     pub branch: String,
     /// 是否启用
     pub enabled: bool,
-    /// 技能所在的子目录路径 (可选, 如 "skills", "my-skills/subdir")
-    #[serde(rename = "skillsPath")]
-    pub skills_path: Option<String>,
 }
 
 /// Legacy install state: directory -> installed timestamp (Claude-only era).
@@ -78,29 +72,24 @@ impl Default for SkillStore {
                     name: "skills".to_string(),
                     branch: "main".to_string(),
                     enabled: true,
-                    skills_path: None,
                 },
                 SkillRepo {
                     owner: "ComposioHQ".to_string(),
                     name: "awesome-claude-skills".to_string(),
                     branch: "master".to_string(),
                     enabled: true,
-                    skills_path: None,
                 },
                 SkillRepo {
                     owner: "cexll".to_string(),
                     name: "myclaude".to_string(),
                     branch: "master".to_string(),
                     enabled: true,
-                    // Keep our historical default: scan skills/ subdir.
-                    skills_path: Some("skills".to_string()),
                 },
                 SkillRepo {
                     owner: "JimLiu".to_string(),
                     name: "baoyu-skills".to_string(),
                     branch: "main".to_string(),
                     enabled: true,
-                    skills_path: None,
                 },
             ],
         }
@@ -122,85 +111,6 @@ pub enum SyncMethod {
     Symlink,
     /// Always use directory copy.
     Copy,
-}
-
-/// Skill enablement per app (stored in skills.json).
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-pub struct SkillApps {
-    #[serde(default)]
-    pub claude: bool,
-    #[serde(default)]
-    pub codex: bool,
-    #[serde(default)]
-    pub gemini: bool,
-}
-
-impl SkillApps {
-    pub fn only(app: &AppType) -> Self {
-        let mut apps = SkillApps::default();
-        apps.set_enabled_for(app, true);
-        apps
-    }
-
-    pub fn is_enabled_for(&self, app: &AppType) -> bool {
-        match app {
-            AppType::Claude => self.claude,
-            AppType::Codex => self.codex,
-            AppType::Gemini => self.gemini,
-        }
-    }
-
-    pub fn set_enabled_for(&mut self, app: &AppType, enabled: bool) {
-        match app {
-            AppType::Claude => self.claude = enabled,
-            AppType::Codex => self.codex = enabled,
-            AppType::Gemini => self.gemini = enabled,
-        }
-    }
-
-    pub fn merge_enabled(&mut self, other: &SkillApps) {
-        self.claude |= other.claude;
-        self.codex |= other.codex;
-        self.gemini |= other.gemini;
-    }
-}
-
-/// Installed skill record (stored in skills.json).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct InstalledSkill {
-    /// Unique id: "owner/name:directory" or "local:directory"
-    pub id: String,
-    pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    pub directory: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "readmeUrl")]
-    pub readme_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "repoOwner")]
-    pub repo_owner: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "repoName")]
-    pub repo_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "repoBranch")]
-    pub repo_branch: Option<String>,
-    pub apps: SkillApps,
-    pub installed_at: i64,
-}
-
-/// Unmanaged skill discovered in app directories.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UnmanagedSkill {
-    pub directory: String,
-    pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub found_in: Vec<String>,
 }
 
 /// skills.json (SSOT index; no DB).
@@ -255,9 +165,6 @@ pub struct DiscoverableSkill {
     pub repo_name: String,
     #[serde(rename = "repoBranch")]
     pub repo_branch: String,
-    /// Optional subdir path inside repo (our CLI extension)
-    #[serde(rename = "skillsPath")]
-    pub skills_path: Option<String>,
 }
 
 /// CLI-friendly skill object (discoverable + installed flag).
@@ -277,8 +184,6 @@ pub struct Skill {
     pub repo_name: Option<String>,
     #[serde(rename = "repoBranch")]
     pub repo_branch: Option<String>,
-    #[serde(rename = "skillsPath")]
-    pub skills_path: Option<String>,
 }
 
 /// Skill metadata extracted from SKILL.md YAML front matter.
@@ -359,78 +264,50 @@ impl SkillService {
     }
 
     // ---------------------------------------------------------------------
-    // skills.json store I/O
+    // Storage (SQLite + settings.json)
     // ---------------------------------------------------------------------
 
     pub fn load_index() -> Result<SkillsIndex, AppError> {
-        let path = get_skills_store_path();
-        if !path.exists() {
-            // Fresh install: create index with migration pending (auto import from app dirs).
-            let mut index = SkillsIndex::default();
-            index.ssot_migration_pending = true;
-            Self::save_index(&index)?;
-            return Ok(index);
-        }
+        let db = Database::init()?;
 
-        let content = fs::read_to_string(&path).map_err(|e| AppError::io(&path, e))?;
-        let value: serde_json::Value =
-            serde_json::from_str(&content).map_err(|e| AppError::json(&path, e))?;
+        // Ensure default repos exist (insert-missing only).
+        let _ = db.init_default_skill_repos();
 
-        // If version is present, treat as v3 index; otherwise attempt legacy conversion.
-        if value.get("version").and_then(|v| v.as_u64()).is_some() {
-            let mut index: SkillsIndex =
-                serde_json::from_value(value).map_err(|e| AppError::json(&path, e))?;
-            if index.version == 0 {
-                index.version = SKILLS_INDEX_VERSION;
-            }
-            return Ok(index);
-        }
+        let repos = db.get_skill_repos()?;
+        let installed = db.get_all_installed_skills()?;
+        let skills: HashMap<String, InstalledSkill> = installed
+            .into_values()
+            .map(|skill| (skill.directory.clone(), skill))
+            .collect();
 
-        // Legacy file: `SkillStore` (Claude-only) -> convert to `SkillsIndex`
-        let legacy: SkillStore =
-            serde_json::from_value(value).map_err(|e| AppError::json(&path, e))?;
+        let sync_method = crate::settings::get_skill_sync_method();
+        let ssot_migration_pending = db
+            .get_setting("skills_ssot_migration_pending")?
+            .is_some_and(|v| v == "true" || v == "1");
 
-        // Backup before overwriting.
-        let backup_path = get_app_config_dir().join("skills.json.bak");
-        if let Err(err) = copy_file(&path, &backup_path) {
-            log::warn!("备份旧 skills.json 失败: {err}");
-        }
-
-        let mut index = SkillsIndex {
+        Ok(SkillsIndex {
             version: SKILLS_INDEX_VERSION,
-            sync_method: SyncMethod::Auto,
-            repos: legacy.repos,
-            skills: HashMap::new(),
-            ssot_migration_pending: true,
-        };
-
-        for (directory, state) in legacy.skills.into_iter() {
-            if !state.installed {
-                continue;
-            }
-            let installed_at = state.installed_at.timestamp();
-            let record = InstalledSkill {
-                id: format!("local:{directory}"),
-                name: directory.clone(),
-                description: None,
-                directory: directory.clone(),
-                readme_url: None,
-                repo_owner: None,
-                repo_name: None,
-                repo_branch: None,
-                apps: SkillApps::only(&AppType::Claude),
-                installed_at,
-            };
-            index.skills.insert(directory, record);
-        }
-
-        Self::save_index(&index)?;
-        Ok(index)
+            sync_method,
+            repos,
+            skills,
+            ssot_migration_pending,
+        })
     }
 
     pub fn save_index(index: &SkillsIndex) -> Result<(), AppError> {
-        let path = get_skills_store_path();
-        write_json_file(&path, index)
+        let db = Database::init()?;
+
+        crate::settings::set_skill_sync_method(index.sync_method)?;
+
+        for repo in &index.repos {
+            db.save_skill_repo(repo)?;
+        }
+
+        for skill in index.skills.values() {
+            db.save_skill(skill)?;
+        }
+
+        Ok(())
     }
 
     // ---------------------------------------------------------------------
@@ -442,6 +319,7 @@ impl SkillService {
             return Ok(0);
         }
 
+        let db = Database::init()?;
         let ssot_dir = Self::get_ssot_dir()?;
         let mut created = 0usize;
 
@@ -510,6 +388,7 @@ impl SkillService {
             }
 
             index.ssot_migration_pending = false;
+            let _ = db.set_setting("skills_ssot_migration_pending", "false");
             Self::save_index(index)?;
             return Ok(created);
         }
@@ -598,6 +477,7 @@ impl SkillService {
         }
 
         index.ssot_migration_pending = false;
+        let _ = db.set_setting("skills_ssot_migration_pending", "false");
         Self::save_index(index)?;
         Ok(created)
     }
@@ -743,13 +623,11 @@ impl SkillService {
     }
 
     pub fn get_sync_method() -> Result<SyncMethod, AppError> {
-        Ok(Self::load_index()?.sync_method)
+        Ok(crate::settings::get_skill_sync_method())
     }
 
     pub fn set_sync_method(method: SyncMethod) -> Result<(), AppError> {
-        let mut index = Self::load_index()?;
-        index.sync_method = method;
-        Self::save_index(&index)
+        crate::settings::set_skill_sync_method(method)
     }
 
     pub fn upsert_repo(repo: SkillRepo) -> Result<(), AppError> {
@@ -768,12 +646,8 @@ impl SkillService {
     }
 
     pub fn remove_repo(owner: &str, name: &str) -> Result<(), AppError> {
-        let mut index = Self::load_index()?;
-        index
-            .repos
-            .retain(|r| !(r.owner == owner && r.name == name));
-        Self::save_index(&index)?;
-        Ok(())
+        let db = Database::init()?;
+        db.delete_skill_repo(owner, name)
     }
 
     fn resolve_directory_from_input(index: &SkillsIndex, input: &str) -> Option<String> {
@@ -833,12 +707,17 @@ impl SkillService {
     }
 
     pub fn uninstall(directory_or_id: &str) -> Result<(), AppError> {
-        let mut index = Self::load_index()?;
+        let index = Self::load_index()?;
         let Some(dir) = Self::resolve_directory_from_input(&index, directory_or_id) else {
             return Err(AppError::Message(format!(
                 "未找到已安装的 Skill: {directory_or_id}"
             )));
         };
+        let record = index
+            .skills
+            .get(&dir)
+            .cloned()
+            .ok_or_else(|| AppError::Message(format!("未找到已安装的 Skill: {dir}")))?;
 
         // Remove from app dirs (best effort).
         for app in [AppType::Claude, AppType::Codex, AppType::Gemini] {
@@ -854,8 +733,8 @@ impl SkillService {
             fs::remove_dir_all(&ssot_path).map_err(|e| AppError::io(&ssot_path, e))?;
         }
 
-        index.skills.remove(&dir);
-        Self::save_index(&index)?;
+        let db = Database::init()?;
+        let _ = db.delete_skill(&record.id)?;
         Ok(())
     }
 
@@ -923,7 +802,6 @@ impl SkillService {
                 name: discoverable.repo_name.clone(),
                 branch: discoverable.repo_branch.clone(),
                 enabled: true,
-                skills_path: discoverable.skills_path.clone(),
             };
 
             let temp_dir = timeout(
@@ -943,13 +821,15 @@ impl SkillService {
                 ))
             })??;
 
-            let source = if let Some(ref skills_path) = repo.skills_path {
-                temp_dir
-                    .join(skills_path.trim_matches('/'))
-                    .join(&install_name)
-            } else {
-                temp_dir.join(&install_name)
-            };
+            let source =
+                Self::find_skill_dir_in_repo(&temp_dir, &install_name)?.ok_or_else(|| {
+                    let _ = fs::remove_dir_all(&temp_dir);
+                    AppError::Message(format_skill_error(
+                        "SKILL_DIR_NOT_FOUND",
+                        &[("directory", install_name.as_str())],
+                        Some("checkRepoUrl"),
+                    ))
+                })?;
 
             if !source.exists() {
                 let _ = fs::remove_dir_all(&temp_dir);
@@ -1209,7 +1089,6 @@ impl SkillService {
                     repo_owner: Some(d.repo_owner),
                     repo_name: Some(d.repo_name),
                     repo_branch: Some(d.repo_branch),
-                    skills_path: d.skills_path,
                 }
             })
             .collect();
@@ -1281,7 +1160,6 @@ impl SkillService {
                 repo_owner: None,
                 repo_name: None,
                 repo_branch: None,
-                skills_path: None,
             });
         }
 
@@ -1306,28 +1184,14 @@ impl SkillService {
                 ))
             })??;
 
-        let scan_dir = if let Some(ref skills_path) = repo.skills_path {
-            let subdir = temp_dir.join(skills_path.trim_matches('/'));
-            if !subdir.exists() {
-                let _ = fs::remove_dir_all(&temp_dir);
-                return Ok(Vec::new());
-            }
-            subdir
-        } else {
-            temp_dir.clone()
-        };
-
         let mut skills = Vec::new();
-        for entry in fs::read_dir(&scan_dir).map_err(|e| AppError::io(&scan_dir, e))? {
-            let entry = entry.map_err(|e| AppError::io(&scan_dir, e))?;
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
+        let skill_dirs = Self::scan_skill_dirs(&temp_dir)?;
+        for path in skill_dirs {
             let skill_md = path.join("SKILL.md");
             if !skill_md.exists() {
                 continue;
             }
+
             let meta = match Self::parse_skill_metadata_static(&skill_md) {
                 Ok(m) => m,
                 Err(_) => SkillMetadata {
@@ -1336,11 +1200,20 @@ impl SkillService {
                 },
             };
 
-            let directory = path.file_name().unwrap().to_string_lossy().to_string();
-            let readme_path = if let Some(ref skills_path) = repo.skills_path {
-                format!("{}/{}", skills_path.trim_matches('/'), directory)
-            } else {
+            let directory = path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if directory.is_empty() {
+                continue;
+            }
+
+            let relative = path.strip_prefix(&temp_dir).unwrap_or(&path);
+            let relative_path = relative.to_string_lossy().replace('\\', "/");
+            let readme_path = if relative_path.trim().is_empty() {
                 directory.clone()
+            } else {
+                relative_path
             };
 
             skills.push(DiscoverableSkill {
@@ -1355,7 +1228,6 @@ impl SkillService {
                 repo_owner: repo.owner.clone(),
                 repo_name: repo.name.clone(),
                 repo_branch: repo.branch.clone(),
-                skills_path: repo.skills_path.clone(),
             });
         }
 
@@ -1540,6 +1412,69 @@ impl SkillService {
         }
 
         Ok(())
+    }
+
+    fn scan_skill_dirs(root: &Path) -> Result<Vec<PathBuf>, AppError> {
+        let mut results = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+
+        while let Some(dir) = stack.pop() {
+            // Treat directories that contain SKILL.md as a skill root.
+            // Do not treat the repo root itself as a skill to avoid random temp dir names.
+            if dir != root && dir.join("SKILL.md").exists() {
+                results.push(dir);
+                continue;
+            }
+
+            let entries = match fs::read_dir(&dir) {
+                Ok(e) => e,
+                Err(e) => return Err(AppError::io(&dir, e)),
+            };
+
+            for entry in entries {
+                let entry = entry.map_err(|e| AppError::io(&dir, e))?;
+                let file_type = entry.file_type().map_err(|e| AppError::io(&dir, e))?;
+                if !file_type.is_dir() {
+                    continue;
+                }
+
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') || name == "node_modules" || name == "target" {
+                    continue;
+                }
+
+                stack.push(entry.path());
+            }
+        }
+
+        Ok(results)
+    }
+
+    fn find_skill_dir_in_repo(root: &Path, directory: &str) -> Result<Option<PathBuf>, AppError> {
+        let target = directory.trim();
+        if target.is_empty() {
+            return Ok(None);
+        }
+
+        let mut matches = Vec::new();
+        for dir in Self::scan_skill_dirs(root)? {
+            let name = dir
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if name.eq_ignore_ascii_case(target) {
+                matches.push(dir);
+            }
+        }
+
+        if matches.len() > 1 {
+            log::warn!(
+                "发现多个同名 skill 目录 '{target}'，将使用第一个匹配项（共 {} 个）",
+                matches.len()
+            );
+        }
+
+        Ok(matches.into_iter().next())
     }
 
     fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), AppError> {

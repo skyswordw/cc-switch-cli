@@ -1,5 +1,6 @@
 use super::provider::ProviderService;
 use crate::app_config::{AppType, MultiAppConfig};
+use crate::database::Database;
 use crate::error::AppError;
 use crate::provider::Provider;
 use crate::store::AppState;
@@ -27,20 +28,21 @@ pub struct BackupInfo {
 pub struct ConfigService;
 
 impl ConfigService {
-    /// 为当前 config.json 创建备份，返回备份 ID（若文件不存在则返回空字符串）。
+    /// 为当前数据库创建 SQL 备份，返回备份 ID（若数据库不存在则返回空字符串）。
     ///
     /// # 参数
-    /// - `config_path`: 配置文件路径
+    /// - `config_path`: 兼容参数（忽略），保留给旧调用方
     /// - `custom_name`: 可选的自定义名称
     ///
     /// # 命名规则
-    /// - 有自定义名称：`{custom_name}_{timestamp}.json`
-    /// - 无自定义名称：`backup_{timestamp}.json`
+    /// - 有自定义名称：`{custom_name}_{timestamp}.sql`
+    /// - 无自定义名称：`backup_{timestamp}.sql`
     pub fn create_backup(
         config_path: &Path,
         custom_name: Option<String>,
     ) -> Result<String, AppError> {
-        if !config_path.exists() {
+        let db_path = crate::config::get_app_config_dir().join("cc-switch.db");
+        if !db_path.exists() {
             return Ok(String::new());
         }
 
@@ -53,14 +55,15 @@ impl ConfigService {
 
         let backup_dir = config_path
             .parent()
+            .or_else(|| db_path.parent())
             .ok_or_else(|| AppError::Config("Invalid config path".into()))?
             .join("backups");
 
         fs::create_dir_all(&backup_dir).map_err(|e| AppError::io(&backup_dir, e))?;
 
-        let backup_path = backup_dir.join(format!("{backup_id}.json"));
-        let contents = fs::read(config_path).map_err(|e| AppError::io(config_path, e))?;
-        fs::write(&backup_path, contents).map_err(|e| AppError::io(&backup_path, e))?;
+        let backup_path = backup_dir.join(format!("{backup_id}.sql"));
+        let db = Database::init()?;
+        db.export_sql(&backup_path)?;
 
         Self::cleanup_old_backups(&backup_dir, MAX_BACKUPS)?;
 
@@ -86,7 +89,7 @@ impl ConfigService {
                 entry
                     .path()
                     .extension()
-                    .map(|ext| ext == "json")
+                    .map(|ext| ext == "sql")
                     .unwrap_or(false)
             })
             .filter_map(|entry| {
@@ -122,7 +125,7 @@ impl ConfigService {
             .ok_or_else(|| AppError::Config("Invalid config path".into()))?
             .join("backups");
 
-        let backup_path = backup_dir.join(format!("{}.json", backup_id));
+        let backup_path = backup_dir.join(format!("{}.sql", backup_id));
 
         if !backup_path.exists() {
             return Err(AppError::Message(format!("备份文件不存在: {}", backup_id)));
@@ -188,7 +191,7 @@ impl ConfigService {
                     entry
                         .path()
                         .extension()
-                        .map(|ext| ext == "json")
+                        .map(|ext| ext == "sql")
                         .unwrap_or(false)
                 })
                 .collect::<Vec<_>>(),
@@ -223,36 +226,21 @@ impl ConfigService {
 
     /// 将当前 config.json 拷贝到目标路径。
     pub fn export_config_to_path(target_path: &Path) -> Result<(), AppError> {
-        let config_path = crate::config::get_app_config_path();
-        let config_content =
-            fs::read_to_string(&config_path).map_err(|e| AppError::io(&config_path, e))?;
-        fs::write(target_path, config_content).map_err(|e| AppError::io(target_path, e))
+        let db = Database::init()?;
+        db.export_sql(target_path)
     }
 
-    /// 从磁盘文件加载配置并写回 config.json，返回备份 ID 及新配置。
-    pub fn load_config_for_import(file_path: &Path) -> Result<(MultiAppConfig, String), AppError> {
-        let import_content =
-            fs::read_to_string(file_path).map_err(|e| AppError::io(file_path, e))?;
-
-        let new_config: MultiAppConfig =
-            serde_json::from_str(&import_content).map_err(|e| AppError::json(file_path, e))?;
-
-        let config_path = crate::config::get_app_config_path();
-        let backup_id = Self::create_backup(&config_path, None)?;
-
-        fs::write(&config_path, &import_content).map_err(|e| AppError::io(&config_path, e))?;
-
-        Ok((new_config, backup_id))
-    }
-
-    /// 将外部配置文件内容加载并写入应用状态。
     pub fn import_config_from_path(file_path: &Path, state: &AppState) -> Result<String, AppError> {
-        let (new_config, backup_id) = Self::load_config_for_import(file_path)?;
-
-        {
-            let mut guard = state.config.write().map_err(AppError::from)?;
-            *guard = new_config;
+        let db_path = crate::config::get_app_config_dir().join("cc-switch.db");
+        if !db_path.exists() {
+            return Err(AppError::Config("数据库不存在，无法导入".to_string()));
         }
+
+        // Pre-import backup (SQL).
+        let backup_id = Self::create_backup(&db_path, None)?;
+
+        // Import SQL into DB (also performs an internal binary snapshot backup).
+        state.db.import_sql(file_path)?;
 
         Ok(backup_id)
     }

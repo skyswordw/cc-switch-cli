@@ -1,9 +1,8 @@
-use cc_switch_lib::SkillService;
-use serde_json::json;
+use cc_switch_lib::{Database, SkillService};
 
 #[path = "support.rs"]
 mod support;
-use support::{ensure_test_home, reset_test_fs, test_mutex};
+use support::{ensure_test_home, lock_test_mutex, reset_test_fs};
 
 fn write_skill_md(dir: &std::path::Path, name: &str, description: &str) {
     std::fs::create_dir_all(dir).expect("create skill dir");
@@ -16,12 +15,16 @@ fn write_skill_md(dir: &std::path::Path, name: &str, description: &str) {
 
 #[test]
 fn list_installed_triggers_initial_ssot_migration() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let home = ensure_test_home();
 
     let claude_skill_dir = home.join(".claude").join("skills").join("hello-skill");
     write_skill_md(&claude_skill_dir, "Hello Skill", "A test skill");
+
+    let db = Database::init().expect("init db");
+    db.set_setting("skills_ssot_migration_pending", "true")
+        .expect("set migration pending flag");
 
     let installed = SkillService::list_installed().expect("list installed");
     assert_eq!(installed.len(), 1);
@@ -37,30 +40,32 @@ fn list_installed_triggers_initial_ssot_migration() {
         "SSOT directory should be created and populated"
     );
 
-    let index_path = home.join(".cc-switch").join("skills.json");
-    let index_value: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&index_path).expect("read skills.json"))
-            .expect("parse skills.json");
-    assert_eq!(index_value.get("version").and_then(|v| v.as_u64()), Some(1));
+    let db = Database::init().expect("init db");
+    let pending = db
+        .get_setting("skills_ssot_migration_pending")
+        .expect("read migration pending flag");
     assert_eq!(
-        index_value
-            .get("ssotMigrationPending")
-            .and_then(|v| v.as_bool()),
-        Some(false),
+        pending.as_deref(),
+        Some("false"),
         "migration flag should be cleared after import"
     );
+
+    let all = db
+        .get_all_installed_skills()
+        .expect("get all installed skills");
+    let migrated = all
+        .values()
+        .find(|s| s.directory == "hello-skill")
+        .expect("hello-skill should exist in db");
     assert!(
-        index_value
-            .get("skills")
-            .and_then(|v| v.get("hello-skill"))
-            .is_some(),
-        "skills.json should contain imported record"
+        migrated.apps.claude,
+        "db record should be enabled for claude"
     );
 }
 
 #[test]
 fn pending_migration_with_existing_managed_list_does_not_claim_unmanaged_skills() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let home = ensure_test_home();
 
@@ -77,26 +82,20 @@ fn pending_migration_with_existing_managed_list_does_not_claim_unmanaged_skills(
         "Unmanaged",
     );
 
-    // Pre-seed skills.json with a managed list containing only "managed-skill" and migration pending.
-    let index_path = home.join(".cc-switch").join("skills.json");
-    std::fs::create_dir_all(index_path.parent().expect("parent")).expect("create .cc-switch");
+    // Seed the DB with a managed list containing only "managed-skill".
+    SkillService::import_from_apps(vec!["managed-skill".to_string()])
+        .expect("import managed-skill from apps");
 
-    let seeded = json!({
-        "version": 1,
-        "syncMethod": "auto",
-        "ssotMigrationPending": true,
-        "skills": {
-            "managed-skill": {
-                "id": "local:managed-skill",
-                "name": "managed-skill",
-                "directory": "managed-skill",
-                "apps": { "claude": true, "codex": false, "gemini": false },
-                "installedAt": 1
-            }
-        }
-    });
-    std::fs::write(&index_path, serde_json::to_string_pretty(&seeded).unwrap())
-        .expect("write seeded skills.json");
+    // Remove SSOT copy to ensure pending migration performs a best-effort re-copy.
+    let ssot_dir = home.join(".cc-switch").join("skills");
+    if ssot_dir.join("managed-skill").exists() {
+        std::fs::remove_dir_all(ssot_dir.join("managed-skill"))
+            .expect("remove managed-skill ssot dir");
+    }
+
+    let db = Database::init().expect("init db");
+    db.set_setting("skills_ssot_migration_pending", "true")
+        .expect("set migration pending flag");
 
     // Calling list_installed should perform best-effort SSOT copy for the managed skill,
     // without auto-importing all app dir skills into the managed list.
@@ -104,7 +103,6 @@ fn pending_migration_with_existing_managed_list_does_not_claim_unmanaged_skills(
     assert_eq!(installed.len(), 1);
     assert_eq!(installed[0].directory, "managed-skill");
 
-    let ssot_dir = home.join(".cc-switch").join("skills");
     assert!(
         ssot_dir.join("managed-skill").exists(),
         "managed skill should be copied into SSOT"
@@ -114,21 +112,21 @@ fn pending_migration_with_existing_managed_list_does_not_claim_unmanaged_skills(
         "unmanaged skill should NOT be claimed/copied during pending migration when managed list is non-empty"
     );
 
-    let index_value: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&index_path).expect("read skills.json"))
-            .expect("parse skills.json");
+    let db = Database::init().expect("init db");
+    let pending = db
+        .get_setting("skills_ssot_migration_pending")
+        .expect("read migration pending flag");
     assert_eq!(
-        index_value
-            .get("ssotMigrationPending")
-            .and_then(|v| v.as_bool()),
-        Some(false),
+        pending.as_deref(),
+        Some("false"),
         "migration flag should be cleared after best-effort copy"
     );
+
+    let all = db
+        .get_all_installed_skills()
+        .expect("get all installed skills");
     assert!(
-        index_value
-            .get("skills")
-            .and_then(|v| v.get("unmanaged-skill"))
-            .is_none(),
-        "unmanaged skill should remain unmanaged (not added to index)"
+        all.values().all(|s| s.directory != "unmanaged-skill"),
+        "unmanaged skill should remain unmanaged (not added to db)"
     );
 }

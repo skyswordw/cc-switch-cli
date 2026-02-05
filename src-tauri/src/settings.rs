@@ -52,6 +52,9 @@ pub struct AppSettings {
     /// 是否开机自启
     #[serde(default)]
     pub launch_on_startup: bool,
+    /// Skills 同步方式（auto|symlink|copy）
+    #[serde(default)]
+    pub skill_sync_method: crate::services::skill::SyncMethod,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security: Option<SecuritySettings>,
     /// Claude 自定义端点列表
@@ -81,6 +84,7 @@ impl Default for AppSettings {
             gemini_config_dir: None,
             language: None,
             launch_on_startup: false,
+            skill_sync_method: crate::services::skill::SyncMethod::default(),
             security: None,
             custom_endpoints_claude: HashMap::new(),
             custom_endpoints_codex: HashMap::new(),
@@ -245,4 +249,17 @@ pub fn get_gemini_override_dir() -> Option<PathBuf> {
         .gemini_config_dir
         .as_ref()
         .map(|p| resolve_override_path(p))
+}
+
+pub fn get_skill_sync_method() -> crate::services::skill::SyncMethod {
+    settings_store()
+        .read()
+        .map(|s| s.skill_sync_method)
+        .unwrap_or_default()
+}
+
+pub fn set_skill_sync_method(method: crate::services::skill::SyncMethod) -> Result<(), AppError> {
+    let mut settings = get_settings();
+    settings.skill_sync_method = method;
+    update_settings(settings)
 }

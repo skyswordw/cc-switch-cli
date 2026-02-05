@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{self, KeyEventKind};
 use serde_json::Value;
 
-use crate::app_config::{AppType, MultiAppConfig};
+use crate::app_config::AppType;
 use crate::cli::i18n::{set_language, texts};
 use crate::error::AppError;
 use crate::provider::Provider;
@@ -834,14 +834,14 @@ fn handle_action(
             Ok(())
         }
         Action::ConfigShowFull => {
-            let title = data
-                .config
-                .config_path
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| texts::tui_default_config_filename().to_string());
-            let content = std::fs::read_to_string(&data.config.config_path)
-                .unwrap_or_else(|e| texts::tui_error_failed_to_read_config(&e.to_string()));
+            let state = load_state()?;
+            let config = state.config.read().map_err(AppError::from)?;
+            let content = serde_json::to_string_pretty(&*config)
+                .map_err(|e| AppError::Message(texts::failed_to_serialize_json(&e.to_string())))?;
+            let title = texts::config_show_full()
+                .trim_start_matches("👁️")
+                .trim()
+                .to_string();
             app.overlay = Overlay::TextView(TextViewState {
                 title,
                 lines: content.lines().map(|s| s.to_string()).collect(),
@@ -870,8 +870,8 @@ fn handle_action(
             Ok(())
         }
         Action::ConfigBackup { name } => {
-            let config_path = crate::config::get_app_config_path();
-            let id = ConfigService::create_backup(&config_path, name)?;
+            let db_path = crate::config::get_app_config_dir().join("cc-switch.db");
+            let id = ConfigService::create_backup(&db_path, name)?;
             if id.is_empty() {
                 app.push_toast(texts::tui_toast_no_config_file_to_backup(), ToastKind::Info);
             } else {
@@ -895,8 +895,9 @@ fn handle_action(
             Ok(())
         }
         Action::ConfigValidate => {
-            let config_path = crate::config::get_app_config_path();
-            if !config_path.exists() {
+            let config_dir = crate::config::get_app_config_dir();
+            let db_path = config_dir.join("cc-switch.db");
+            if !db_path.exists() {
                 app.push_toast(
                     texts::tui_toast_config_file_does_not_exist(),
                     ToastKind::Warning,
@@ -904,56 +905,27 @@ fn handle_action(
                 return Ok(());
             }
 
-            match MultiAppConfig::load() {
-                Ok(cfg) => {
-                    let claude_count = cfg
-                        .get_manager(&AppType::Claude)
-                        .map(|m| m.providers.len())
-                        .unwrap_or(0);
-                    let codex_count = cfg
-                        .get_manager(&AppType::Codex)
-                        .map(|m| m.providers.len())
-                        .unwrap_or(0);
-                    let gemini_count = cfg
-                        .get_manager(&AppType::Gemini)
-                        .map(|m| m.providers.len())
-                        .unwrap_or(0);
-                    let mcp_count = cfg.mcp.servers.as_ref().map(|s| s.len()).unwrap_or(0);
+            let db = crate::Database::init()?;
+            let claude_count = db.get_all_providers("claude")?.len();
+            let codex_count = db.get_all_providers("codex")?.len();
+            let gemini_count = db.get_all_providers("gemini")?.len();
+            let mcp_count = db.get_all_mcp_servers()?.len();
 
-                    let lines = vec![
-                        texts::tui_config_validation_ok().to_string(),
-                        String::new(),
-                        texts::tui_config_validation_provider_count(
-                            AppType::Claude.as_str(),
-                            claude_count,
-                        ),
-                        texts::tui_config_validation_provider_count(
-                            AppType::Codex.as_str(),
-                            codex_count,
-                        ),
-                        texts::tui_config_validation_provider_count(
-                            AppType::Gemini.as_str(),
-                            gemini_count,
-                        ),
-                        texts::tui_config_validation_mcp_servers(mcp_count),
-                    ];
-                    app.overlay = Overlay::TextView(TextViewState {
-                        title: texts::tui_config_validation_title().to_string(),
-                        lines,
-                        scroll: 0,
-                    });
-                    app.push_toast(texts::tui_toast_validation_passed(), ToastKind::Success);
-                    Ok(())
-                }
-                Err(err) => {
-                    app.overlay = Overlay::TextView(TextViewState {
-                        title: texts::tui_config_validation_failed_title().to_string(),
-                        lines: vec![err.to_string()],
-                        scroll: 0,
-                    });
-                    Err(err)
-                }
-            }
+            let lines = vec![
+                texts::tui_config_validation_ok().to_string(),
+                String::new(),
+                texts::tui_config_validation_provider_count(AppType::Claude.as_str(), claude_count),
+                texts::tui_config_validation_provider_count(AppType::Codex.as_str(), codex_count),
+                texts::tui_config_validation_provider_count(AppType::Gemini.as_str(), gemini_count),
+                texts::tui_config_validation_mcp_servers(mcp_count),
+            ];
+            app.overlay = Overlay::TextView(TextViewState {
+                title: texts::tui_config_validation_title().to_string(),
+                lines,
+                scroll: 0,
+            });
+            app.push_toast(texts::tui_toast_validation_passed(), ToastKind::Success);
+            Ok(())
         }
         Action::ConfigCommonSnippetClear => {
             let state = load_state()?;
@@ -984,12 +956,14 @@ fn handle_action(
             Ok(())
         }
         Action::ConfigReset => {
-            let config_path = crate::config::get_app_config_path();
-            let backup_id = ConfigService::create_backup(&config_path, None)?;
-            if config_path.exists() {
-                std::fs::remove_file(&config_path).map_err(|e| AppError::io(&config_path, e))?;
+            let config_dir = crate::config::get_app_config_dir();
+            let db_path = config_dir.join("cc-switch.db");
+            let backup_id = ConfigService::create_backup(&db_path, None)?;
+
+            if db_path.exists() {
+                std::fs::remove_file(&db_path).map_err(|e| AppError::io(&db_path, e))?;
             }
-            let _ = MultiAppConfig::load()?;
+            let _ = crate::Database::init()?;
             if backup_id.is_empty() {
                 app.push_toast(
                     texts::tui_toast_config_reset_to_defaults(),
@@ -1218,7 +1192,6 @@ fn parse_repo_spec(raw: &str) -> Result<SkillRepo, AppError> {
         name: name.to_string(),
         branch: branch.unwrap_or("main").to_string(),
         enabled: true,
-        skills_path: None,
     })
 }
 

@@ -1,7 +1,6 @@
 use clap::Subcommand;
-use std::sync::RwLock;
 
-use crate::app_config::{AppType, MultiAppConfig};
+use crate::app_config::AppType;
 use crate::cli::commands::provider_input::{
     current_timestamp, display_provider_summary, generate_provider_id, prompt_basic_fields,
     prompt_optional_fields, prompt_settings_config, prompt_settings_config_for_add, OptionalFields,
@@ -70,10 +69,7 @@ pub fn execute(cmd: ProviderCommand, app: Option<AppType>) -> Result<(), AppErro
 }
 
 fn get_state() -> Result<AppState, AppError> {
-    let config = MultiAppConfig::load()?;
-    Ok(AppState {
-        config: RwLock::new(config),
-    })
+    AppState::try_new()
 }
 
 fn list_providers(app_type: AppType) -> Result<(), AppError> {
@@ -290,9 +286,7 @@ fn add_provider(app_type: AppType) -> Result<(), AppError> {
     };
 
     // 1. 加载配置和状态
-    let state = AppState {
-        config: RwLock::new(MultiAppConfig::load()?),
-    };
+    let state = AppState::try_new()?;
     let config = state.config.read().unwrap();
     let manager = config
         .get_manager(&app_type)
@@ -394,9 +388,7 @@ fn edit_provider(app_type: AppType, id: &str) -> Result<(), AppError> {
     println!("{}", "=".repeat(50));
 
     // 1. 加载并验证供应商存在
-    let state = AppState {
-        config: RwLock::new(MultiAppConfig::load()?),
-    };
+    let state = AppState::try_new()?;
     let config = state.config.read().unwrap();
     let manager = config
         .get_manager(&app_type)

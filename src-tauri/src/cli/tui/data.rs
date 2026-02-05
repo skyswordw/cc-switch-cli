@@ -1,10 +1,9 @@
 use std::path::PathBuf;
-use std::sync::RwLock;
 
 use indexmap::IndexMap;
 use serde_json::Value;
 
-use crate::app_config::{AppType, McpServer, MultiAppConfig};
+use crate::app_config::{AppType, McpServer};
 use crate::error::AppError;
 use crate::prompt::Prompt;
 use crate::provider::Provider;
@@ -73,10 +72,7 @@ pub struct UiData {
 }
 
 pub(crate) fn load_state() -> Result<AppState, AppError> {
-    let config = MultiAppConfig::load()?;
-    Ok(AppState {
-        config: RwLock::new(config),
-    })
+    AppState::try_new()
 }
 
 impl UiData {
@@ -198,8 +194,8 @@ fn load_prompts(state: &AppState, app_type: &AppType) -> Result<PromptsSnapshot,
 }
 
 fn load_config_snapshot(state: &AppState, app_type: &AppType) -> Result<ConfigSnapshot, AppError> {
-    let config_path = crate::config::get_app_config_path();
     let config_dir = crate::config::get_app_config_dir();
+    let config_path = config_dir.join("cc-switch.db");
     let backups = ConfigService::list_backups(&config_path)?;
     let common_snippet = state
         .config

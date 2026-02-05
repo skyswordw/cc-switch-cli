@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs, sync::RwLock};
+use std::{collections::HashMap, fs};
 
 use serde_json::json;
 
@@ -9,13 +9,13 @@ use cc_switch_lib::{
 
 #[path = "support.rs"]
 mod support;
-use support::{ensure_test_home, reset_test_fs, test_mutex};
+use support::{ensure_test_home, lock_test_mutex, reset_test_fs, state_from_config};
 
 #[test]
 fn import_default_config_claude_persists_provider() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
-    let home = ensure_test_home();
+    let _home = ensure_test_home();
 
     let settings_path = get_claude_settings_path();
     if let Some(parent) = settings_path.parent() {
@@ -35,9 +35,7 @@ fn import_default_config_claude_persists_provider() {
 
     let mut config = MultiAppConfig::default();
     config.ensure_app(&AppType::Claude);
-    let state = AppState {
-        config: RwLock::new(config),
-    };
+    let state = state_from_config(config);
 
     ProviderService::import_default_config(&state, AppType::Claude)
         .expect("import default config succeeds");
@@ -55,23 +53,24 @@ fn import_default_config_claude_persists_provider() {
     );
     drop(guard);
 
-    // 验证配置已持久化
-    let config_path = home.join(".cc-switch").join("config.json");
+    // 验证配置已持久化到数据库
+    let providers = state
+        .db
+        .get_all_providers("claude")
+        .expect("load providers from db");
     assert!(
-        config_path.exists(),
-        "importing default config should persist config.json"
+        providers.contains_key("default"),
+        "importing default config should persist provider to db"
     );
 }
 
 #[test]
 fn import_default_config_without_live_file_returns_error() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let home = ensure_test_home();
 
-    let state = AppState {
-        config: RwLock::new(MultiAppConfig::default()),
-    };
+    let state = state_from_config(MultiAppConfig::default());
 
     let err = ProviderService::import_default_config(&state, AppType::Claude)
         .expect_err("missing live file should error");
@@ -87,16 +86,19 @@ fn import_default_config_without_live_file_returns_error() {
         other => panic!("unexpected error variant: {other:?}"),
     }
 
-    let config_path = home.join(".cc-switch").join("config.json");
+    let providers = state
+        .db
+        .get_all_providers("claude")
+        .expect("load providers from db");
     assert!(
-        !config_path.exists(),
-        "failed import should not create config.json"
+        providers.is_empty(),
+        "failed import should not persist providers to db"
     );
 }
 
 #[test]
 fn import_mcp_from_claude_creates_config_and_enables_servers() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let home = ensure_test_home();
 
@@ -115,9 +117,7 @@ fn import_mcp_from_claude_creates_config_and_enables_servers() {
     )
     .expect("seed ~/.claude.json");
 
-    let state = AppState {
-        config: RwLock::new(MultiAppConfig::default()),
-    };
+    let state = state_from_config(MultiAppConfig::default());
 
     let changed = McpService::import_from_claude(&state).expect("import mcp from claude succeeds");
     assert!(
@@ -141,16 +141,19 @@ fn import_mcp_from_claude_creates_config_and_enables_servers() {
     );
     drop(guard);
 
-    let config_path = home.join(".cc-switch").join("config.json");
+    let servers_db = state
+        .db
+        .get_all_mcp_servers()
+        .expect("load mcp servers from db");
     assert!(
-        config_path.exists(),
-        "state.save should persist config.json when changes detected"
+        servers_db.contains_key("echo"),
+        "state.save should persist imported server to db"
     );
 }
 
 #[test]
 fn import_mcp_from_claude_invalid_json_preserves_state() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let home = ensure_test_home();
 
@@ -158,9 +161,7 @@ fn import_mcp_from_claude_invalid_json_preserves_state() {
     fs::write(&mcp_path, "{\"mcpServers\":") // 不完整 JSON
         .expect("seed invalid ~/.claude.json");
 
-    let state = AppState {
-        config: RwLock::new(MultiAppConfig::default()),
-    };
+    let state = state_from_config(MultiAppConfig::default());
 
     let err =
         McpService::import_from_claude(&state).expect_err("invalid json should bubble up error");
@@ -172,16 +173,19 @@ fn import_mcp_from_claude_invalid_json_preserves_state() {
         other => panic!("unexpected error variant: {other:?}"),
     }
 
-    let config_path = home.join(".cc-switch").join("config.json");
+    let servers_db = state
+        .db
+        .get_all_mcp_servers()
+        .expect("load mcp servers from db");
     assert!(
-        !config_path.exists(),
-        "failed import should not persist config.json"
+        servers_db.is_empty(),
+        "failed import should not persist servers to db"
     );
 }
 
 #[test]
 fn import_mcp_from_gemini_imports_http_and_sse_servers() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let home = ensure_test_home();
 
@@ -207,9 +211,7 @@ fn import_mcp_from_gemini_imports_http_and_sse_servers() {
     )
     .expect("seed ~/.gemini/settings.json");
 
-    let state = AppState {
-        config: RwLock::new(MultiAppConfig::default()),
-    };
+    let state = state_from_config(MultiAppConfig::default());
 
     McpService::import_from_gemini(&state).expect("import mcp from gemini succeeds");
 
@@ -291,7 +293,7 @@ fn import_mcp_from_gemini_imports_http_and_sse_servers() {
 
 #[test]
 fn set_mcp_enabled_for_codex_writes_live_config() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let home = ensure_test_home();
 
@@ -323,6 +325,7 @@ fn set_mcp_enabled_for_codex_writes_live_config() {
                 claude: false,
                 codex: false, // 初始未启用
                 gemini: false,
+                opencode: false,
             },
             description: None,
             homepage: None,
@@ -331,9 +334,7 @@ fn set_mcp_enabled_for_codex_writes_live_config() {
         },
     );
 
-    let state = AppState {
-        config: RwLock::new(config),
-    };
+    let state = state_from_config(config);
 
     // v3.7.0: 使用 toggle_app 替代 set_enabled
     McpService::toggle_app(&state, "codex-server", AppType::Codex, true)
@@ -367,7 +368,7 @@ fn set_mcp_enabled_for_codex_writes_live_config() {
 
 #[test]
 fn upsert_server_skips_live_sync_when_gemini_uninitialized() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let home = ensure_test_home();
 
@@ -379,9 +380,7 @@ fn upsert_server_skips_live_sync_when_gemini_uninitialized() {
     let mut config = MultiAppConfig::default();
     config.mcp.servers = Some(HashMap::new());
 
-    let state = AppState {
-        config: RwLock::new(config),
-    };
+    let state = state_from_config(config);
 
     let server = McpServer {
         id: "gemini-server".to_string(),
@@ -394,6 +393,7 @@ fn upsert_server_skips_live_sync_when_gemini_uninitialized() {
             claude: false,
             codex: false,
             gemini: true,
+            opencode: false,
         },
         description: None,
         homepage: None,
@@ -411,7 +411,7 @@ fn upsert_server_skips_live_sync_when_gemini_uninitialized() {
 
 #[test]
 fn upsert_server_disables_app_removes_from_gemini_live() {
-    let _guard = test_mutex().lock().expect("acquire test mutex");
+    let _guard = lock_test_mutex();
     reset_test_fs();
     let home = ensure_test_home();
     let url = "http://localhost:1234";
@@ -461,6 +461,7 @@ fn upsert_server_disables_app_removes_from_gemini_live() {
                 claude: false,
                 codex: false,
                 gemini: true,
+                opencode: false,
             },
             description: None,
             homepage: None,
@@ -469,9 +470,7 @@ fn upsert_server_disables_app_removes_from_gemini_live() {
         },
     );
 
-    let state = AppState {
-        config: RwLock::new(config),
-    };
+    let state = state_from_config(config);
 
     // 模拟“取消勾选 Gemini”
     let server = McpServer {
@@ -485,6 +484,7 @@ fn upsert_server_disables_app_removes_from_gemini_live() {
             claude: false,
             codex: false,
             gemini: false,
+            opencode: false,
         },
         description: None,
         homepage: None,
