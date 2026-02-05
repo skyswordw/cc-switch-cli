@@ -7,6 +7,22 @@ All notable changes to CC Switch CLI will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.6.0] - 2026-02-05
+
+### Added
+
+- **Interactive (TUI)**: Home now includes a local environment check for installed tool versions (Claude/Codex/Gemini/OpenCode), with `r` to refresh.
+- **Providers (TUI)**: Gemini provider forms now support configuring `GEMINI_MODEL` (API Key auth).
+
+### Changed
+
+- **Release**: Publish versionless GitHub Release assets; README download links updated accordingly.
+- **Storage**: Align SQLite store implementation with upstream for parity.
+
+### Fixed
+
+- **Codex**: Support provider configs that contain a full `config.toml` (extract provider settings from `model_provider`/`model_providers`).
+
 ## [4.5.0] - 2026-02-01
 
 ### Added
