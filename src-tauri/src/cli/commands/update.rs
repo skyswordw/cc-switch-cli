@@ -7,6 +7,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use tar::Archive;
 use tempfile::TempDir;
+use url::Url;
 
 use crate::cli::ui::{highlight, info, success};
 use crate::error::AppError;
@@ -33,9 +34,10 @@ struct DownloadedAsset {
 }
 
 pub fn execute(cmd: UpdateCommand) -> Result<(), AppError> {
+    let runtime = create_runtime()?;
     let current_version = env!("CARGO_PKG_VERSION");
     let client = create_http_client()?;
-    let target_tag = resolve_target_tag(&client, cmd.version.as_deref())?;
+    let target_tag = resolve_target_tag(&runtime, &client, cmd.version.as_deref())?;
     let target_version = target_tag.trim_start_matches('v');
 
     if target_version == current_version {
@@ -58,8 +60,9 @@ pub fn execute(cmd: UpdateCommand) -> Result<(), AppError> {
     println!("{}", info(&format!("Downloading: {download_url}")));
     println!("{}", info(&format!("Verifying checksum: {checksum_url}")));
 
-    let downloaded_asset = download_release_asset(&client, &download_url, &asset_name)?;
+    let downloaded_asset = download_release_asset(&runtime, &client, &download_url, &asset_name)?;
     verify_asset_checksum(
+        &runtime,
         &client,
         &downloaded_asset.archive_path,
         &checksum_url,
@@ -79,14 +82,11 @@ pub fn execute(cmd: UpdateCommand) -> Result<(), AppError> {
     Ok(())
 }
 
-fn run_async<T>(
-    fut: impl std::future::Future<Output = Result<T, AppError>>,
-) -> Result<T, AppError> {
+fn create_runtime() -> Result<tokio::runtime::Runtime, AppError> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|e| AppError::Message(format!("Failed to create runtime: {e}")))?
-        .block_on(fut)
+        .map_err(|e| AppError::Message(format!("Failed to create runtime: {e}")))
 }
 
 fn create_http_client() -> Result<reqwest::Client, AppError> {
@@ -95,10 +95,14 @@ fn create_http_client() -> Result<reqwest::Client, AppError> {
         .map_err(|e| AppError::Message(format!("Failed to initialize HTTP client: {e}")))
 }
 
-fn resolve_target_tag(client: &reqwest::Client, version: Option<&str>) -> Result<String, AppError> {
+fn resolve_target_tag(
+    runtime: &tokio::runtime::Runtime,
+    client: &reqwest::Client,
+    version: Option<&str>,
+) -> Result<String, AppError> {
     let tag = match version.map(str::trim).filter(|v| !v.is_empty()) {
         Some(version) => normalize_tag(version),
-        None => run_async(fetch_latest_release_tag(client))?,
+        None => runtime.block_on(fetch_latest_release_tag(client))?,
     };
     validate_target_tag(&tag)?;
     Ok(tag)
@@ -140,8 +144,7 @@ fn normalize_tag(version: &str) -> String {
 }
 
 async fn fetch_latest_release_tag(client: &reqwest::Client) -> Result<String, AppError> {
-    let api_url =
-        format!("{REPO_URL}/releases/latest").replace("github.com", "api.github.com/repos");
+    let api_url = latest_release_api_url(REPO_URL)?;
     let release = client
         .get(api_url)
         .header(reqwest::header::USER_AGENT, "cc-switch-cli-updater")
@@ -154,6 +157,51 @@ async fn fetch_latest_release_tag(client: &reqwest::Client) -> Result<String, Ap
         .await
         .map_err(|e| AppError::Message(format!("Failed to parse latest release response: {e}")))?;
     Ok(release.tag_name)
+}
+
+fn latest_release_api_url(repo_url: &str) -> Result<Url, AppError> {
+    let repo_url = Url::parse(repo_url)
+        .map_err(|e| AppError::Message(format!("Invalid repository URL '{repo_url}': {e}")))?;
+    let host = repo_url
+        .host_str()
+        .ok_or_else(|| AppError::Message(format!("Repository URL is missing host: {repo_url}")))?;
+
+    let path = repo_url.path().trim_matches('/');
+    let mut parts = path.split('/');
+    let owner = parts.next().filter(|s| !s.is_empty()).ok_or_else(|| {
+        AppError::Message(format!(
+            "Repository URL must include owner and repo: {repo_url}"
+        ))
+    })?;
+    let repo = parts.next().filter(|s| !s.is_empty()).ok_or_else(|| {
+        AppError::Message(format!(
+            "Repository URL must include owner and repo: {repo_url}"
+        ))
+    })?;
+    if parts.next().is_some() {
+        return Err(AppError::Message(format!(
+            "Repository URL must be in '<host>/<owner>/<repo>' format: {repo_url}"
+        )));
+    }
+    let repo = repo.strip_suffix(".git").unwrap_or(repo);
+
+    let api_path = if host == "github.com" {
+        format!("/repos/{owner}/{repo}/releases/latest")
+    } else {
+        format!("/api/v3/repos/{owner}/{repo}/releases/latest")
+    };
+
+    let mut api_url = repo_url.clone();
+    if host == "github.com" {
+        api_url
+            .set_host(Some("api.github.com"))
+            .map_err(|_| AppError::Message("Failed to set GitHub API host.".to_string()))?;
+    }
+    api_url.set_path(&api_path);
+    api_url.set_query(None);
+    api_url.set_fragment(None);
+
+    Ok(api_url)
 }
 
 fn release_asset_name() -> Result<String, AppError> {
@@ -176,11 +224,12 @@ fn release_asset_name() -> Result<String, AppError> {
 }
 
 fn download_release_asset(
+    runtime: &tokio::runtime::Runtime,
     client: &reqwest::Client,
     url: &str,
     asset_name: &str,
 ) -> Result<DownloadedAsset, AppError> {
-    run_async(async move {
+    runtime.block_on(async move {
         let mut response = client
             .get(url)
             .header(reqwest::header::USER_AGENT, "cc-switch-cli-updater")
@@ -214,12 +263,13 @@ fn download_release_asset(
 }
 
 fn verify_asset_checksum(
+    runtime: &tokio::runtime::Runtime,
     client: &reqwest::Client,
     archive_path: &Path,
     checksum_url: &str,
     asset_name: &str,
 ) -> Result<(), AppError> {
-    let checksum_content = run_async(download_text(client, checksum_url))?;
+    let checksum_content = runtime.block_on(download_text(client, checksum_url))?;
     let expected = parse_checksum_for_asset(&checksum_content, asset_name)?;
 
     let actual = compute_sha256_hex(archive_path)?;
@@ -267,24 +317,15 @@ fn parse_checksum_for_asset(checksum_content: &str, asset_name: &str) -> Result<
     let expected = checksum_content
         .lines()
         .filter_map(|line| {
-            let line = line.trim();
+            let line = line.trim_end();
             if line.is_empty() {
                 return None;
             }
 
-            let mut parts = line.split_whitespace();
-            let hash = parts.next()?;
-            let mut file = parts.next()?;
-            if parts.next().is_some() {
-                return None;
-            }
-            // sha256sum -b format can include a leading '*'
-            if let Some(stripped) = file.strip_prefix('*') {
-                file = stripped;
-            }
+            let (hash, file) = parse_sha256sum_line(line)?;
 
             if file == asset_name {
-                Some(hash.to_string())
+                Some(hash.to_ascii_lowercase())
             } else {
                 None
             }
@@ -296,6 +337,29 @@ fn parse_checksum_for_asset(checksum_content: &str, asset_name: &str) -> Result<
             "Unable to find SHA256 for {asset_name} in {CHECKSUMS_FILE_NAME}."
         ))
     })
+}
+
+fn parse_sha256sum_line(line: &str) -> Option<(&str, &str)> {
+    // sha256sum output format:
+    // - text mode:   "<64-hex>  <filename>"
+    // - binary mode: "<64-hex> *<filename>"
+    if line.len() < 66 {
+        return None;
+    }
+
+    let (hash, remainder) = line.split_at(64);
+    if !hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+
+    if let Some(file) = remainder.strip_prefix("  ") {
+        return Some((hash, file));
+    }
+    if let Some(file) = remainder.strip_prefix(" *") {
+        return Some((hash, file));
+    }
+
+    None
 }
 
 fn extract_binary(archive_path: &Path) -> Result<PathBuf, AppError> {
@@ -444,18 +508,58 @@ mod tests {
 
     #[test]
     fn parse_checksum_for_asset_finds_plain_filename() {
-        let checksums = "abc123  cc-switch-cli-linux-x64-musl.tar.gz\n";
+        let checksums =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  cc-switch-cli-linux-x64-musl.tar.gz\n";
         let got = parse_checksum_for_asset(checksums, "cc-switch-cli-linux-x64-musl.tar.gz")
             .expect("checksum should exist");
-        assert_eq!(got, "abc123");
+        assert_eq!(
+            got,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
     }
 
     #[test]
     fn parse_checksum_for_asset_supports_star_prefix() {
-        let checksums = "def456 *cc-switch-cli-linux-x64-musl.tar.gz\n";
+        let checksums =
+            "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB *cc-switch-cli-linux-x64-musl.tar.gz\n";
         let got = parse_checksum_for_asset(checksums, "cc-switch-cli-linux-x64-musl.tar.gz")
             .expect("checksum should exist");
-        assert_eq!(got, "def456");
+        assert_eq!(
+            got,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+    }
+
+    #[test]
+    fn parse_checksum_for_asset_supports_spaces_in_filename() {
+        let checksums =
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  file with spaces.tar.gz\n";
+        let got = parse_checksum_for_asset(checksums, "file with spaces.tar.gz")
+            .expect("checksum should exist");
+        assert_eq!(
+            got,
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        );
+    }
+
+    #[test]
+    fn latest_release_api_url_for_github_com() {
+        let url = latest_release_api_url("https://github.com/saladday/cc-switch-cli")
+            .expect("api url should be built");
+        assert_eq!(
+            url.as_str(),
+            "https://api.github.com/repos/saladday/cc-switch-cli/releases/latest"
+        );
+    }
+
+    #[test]
+    fn latest_release_api_url_for_github_enterprise() {
+        let url = latest_release_api_url("https://github.enterprise.local/team/cc-switch-cli.git")
+            .expect("api url should be built");
+        assert_eq!(
+            url.as_str(),
+            "https://github.enterprise.local/api/v3/repos/team/cc-switch-cli/releases/latest"
+        );
     }
 
     #[test]
