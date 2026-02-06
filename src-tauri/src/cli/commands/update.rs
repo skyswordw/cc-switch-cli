@@ -2,9 +2,11 @@ use clap::Args;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 #[cfg(not(windows))]
 use std::process::Command;
+use tempfile::TempDir;
 
 use crate::cli::ui::{highlight, info, success};
 use crate::error::AppError;
@@ -23,6 +25,11 @@ pub struct UpdateCommand {
 #[derive(Debug, Deserialize)]
 struct ReleaseInfo {
     tag_name: String,
+}
+
+struct DownloadedAsset {
+    _temp_dir: TempDir,
+    archive_path: PathBuf,
 }
 
 pub fn execute(cmd: UpdateCommand) -> Result<(), AppError> {
@@ -50,9 +57,9 @@ pub fn execute(cmd: UpdateCommand) -> Result<(), AppError> {
     println!("{}", info(&format!("Downloading: {download_url}")));
     println!("{}", info(&format!("Verifying checksum: {checksum_url}")));
 
-    let downloaded_archive = download_release_asset(&download_url, &asset_name)?;
-    verify_asset_checksum(&downloaded_archive, &checksum_url, &asset_name)?;
-    let extracted_binary = extract_binary(&downloaded_archive)?;
+    let downloaded_asset = download_release_asset(&download_url, &asset_name)?;
+    verify_asset_checksum(&downloaded_asset.archive_path, &checksum_url, &asset_name)?;
+    let extracted_binary = extract_binary(&downloaded_asset.archive_path)?;
     replace_current_binary(&extracted_binary)?;
 
     println!(
@@ -77,10 +84,39 @@ fn run_async<T>(
 }
 
 fn resolve_target_tag(version: Option<&str>) -> Result<String, AppError> {
-    match version.map(str::trim).filter(|v| !v.is_empty()) {
-        Some(version) => Ok(normalize_tag(version)),
-        None => run_async(fetch_latest_release_tag()),
+    let tag = match version.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(version) => normalize_tag(version),
+        None => run_async(fetch_latest_release_tag())?,
+    };
+    validate_target_tag(&tag)?;
+    Ok(tag)
+}
+
+fn validate_target_tag(tag: &str) -> Result<(), AppError> {
+    if !tag.starts_with('v') {
+        return Err(AppError::Message(format!(
+            "Invalid version tag '{tag}': must start with 'v'."
+        )));
     }
+    if tag.len() > 64 {
+        return Err(AppError::Message(format!(
+            "Invalid version tag '{tag}': too long."
+        )));
+    }
+    if tag.contains('/') || tag.contains('\\') || tag.contains("..") {
+        return Err(AppError::Message(format!(
+            "Invalid version tag '{tag}': contains forbidden path characters."
+        )));
+    }
+    if !tag
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_')
+    {
+        return Err(AppError::Message(format!(
+            "Invalid version tag '{tag}': only [A-Za-z0-9._-] allowed."
+        )));
+    }
+    Ok(())
 }
 
 fn normalize_tag(version: &str) -> String {
@@ -130,7 +166,7 @@ fn release_asset_name() -> Result<String, AppError> {
     Ok(name.to_string())
 }
 
-fn download_release_asset(url: &str, asset_name: &str) -> Result<PathBuf, AppError> {
+fn download_release_asset(url: &str, asset_name: &str) -> Result<DownloadedAsset, AppError> {
     run_async(async move {
         let bytes = reqwest::Client::builder()
             .build()
@@ -146,11 +182,14 @@ fn download_release_asset(url: &str, asset_name: &str) -> Result<PathBuf, AppErr
             .await
             .map_err(|e| AppError::Message(format!("Failed to read release asset body: {e}")))?;
 
-        let tmp_dir = std::env::temp_dir().join(format!("cc-switch-update-{}", std::process::id()));
-        fs::create_dir_all(&tmp_dir).map_err(|e| AppError::io(&tmp_dir, e))?;
-        let archive_path = tmp_dir.join(asset_name);
+        let temp_dir = tempfile::tempdir()
+            .map_err(|e| AppError::Message(format!("Failed to create temp directory: {e}")))?;
+        let archive_path = temp_dir.path().join(asset_name);
         fs::write(&archive_path, &bytes).map_err(|e| AppError::io(&archive_path, e))?;
-        Ok(archive_path)
+        Ok(DownloadedAsset {
+            _temp_dir: temp_dir,
+            archive_path,
+        })
     })
 }
 
@@ -162,8 +201,7 @@ fn verify_asset_checksum(
     let checksum_content = run_async(download_text(checksum_url.to_string()))?;
     let expected = parse_checksum_for_asset(&checksum_content, asset_name)?;
 
-    let data = fs::read(archive_path).map_err(|e| AppError::io(archive_path, e))?;
-    let actual = format!("{:x}", Sha256::digest(&data));
+    let actual = compute_sha256_hex(archive_path)?;
 
     if actual != expected {
         return Err(AppError::Message(format!(
@@ -172,6 +210,22 @@ fn verify_asset_checksum(
     }
 
     Ok(())
+}
+
+fn compute_sha256_hex(path: &Path) -> Result<String, AppError> {
+    let mut file = fs::File::open(path).map_err(|e| AppError::io(path, e))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 8192];
+
+    loop {
+        let n = file.read(&mut buffer).map_err(|e| AppError::io(path, e))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 async fn download_text(url: String) -> Result<String, AppError> {
@@ -284,12 +338,13 @@ fn extract_zip_binary(archive_path: &Path, extract_dir: &Path) -> Result<PathBuf
     let file = fs::File::open(archive_path).map_err(|e| AppError::io(archive_path, e))?;
     let mut zip = zip::ZipArchive::new(file)
         .map_err(|e| AppError::Message(format!("Failed to open ZIP archive: {e}")))?;
+    let binary_filename = format!("{BINARY_NAME}.exe");
 
-    let mut entry = zip
-        .by_name("cc-switch.exe")
-        .map_err(|_| AppError::Message("ZIP archive does not contain cc-switch.exe".to_string()))?;
+    let mut entry = zip.by_name(&binary_filename).map_err(|_| {
+        AppError::Message(format!("ZIP archive does not contain {binary_filename}"))
+    })?;
 
-    let binary_path = extract_dir.join("cc-switch.exe");
+    let binary_path = extract_dir.join(binary_filename);
     let mut output = fs::File::create(&binary_path).map_err(|e| AppError::io(&binary_path, e))?;
     std::io::copy(&mut entry, &mut output)
         .map_err(|e| AppError::Message(format!("Failed to extract binary from ZIP: {e}")))?;
@@ -389,5 +444,16 @@ mod tests {
         let got = parse_checksum_for_asset(checksums, "cc-switch-cli-linux-x64-musl.tar.gz")
             .expect("checksum should exist");
         assert_eq!(got, "def456");
+    }
+
+    #[test]
+    fn validate_target_tag_accepts_normal_value() {
+        validate_target_tag("v4.6.3-rc1").expect("valid tag should pass");
+    }
+
+    #[test]
+    fn validate_target_tag_rejects_path_content() {
+        let err = validate_target_tag("v4.6.3/../../evil").expect_err("must reject traversal");
+        assert!(err.to_string().contains("forbidden"));
     }
 }
