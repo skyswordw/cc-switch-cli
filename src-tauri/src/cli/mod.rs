@@ -60,6 +60,9 @@ pub enum Commands {
     #[command(subcommand)]
     Env(commands::env::EnvCommand),
 
+    /// Update cc-switch binary to latest release
+    Update(commands::update::UpdateCommand),
+
     /// Enter interactive mode
     #[command(alias = "ui")]
     Interactive,
