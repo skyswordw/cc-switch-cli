@@ -1,5 +1,6 @@
 use clap::Args;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(not(windows))]
@@ -10,6 +11,7 @@ use crate::error::AppError;
 
 const REPO_URL: &str = env!("CARGO_PKG_REPOSITORY");
 const BINARY_NAME: &str = "cc-switch";
+const CHECKSUMS_FILE_NAME: &str = "checksums.txt";
 
 #[derive(Args, Debug, Clone)]
 pub struct UpdateCommand {
@@ -38,6 +40,7 @@ pub fn execute(cmd: UpdateCommand) -> Result<(), AppError> {
 
     let asset_name = release_asset_name()?;
     let download_url = format!("{REPO_URL}/releases/download/{target_tag}/{asset_name}");
+    let checksum_url = format!("{REPO_URL}/releases/download/{target_tag}/{CHECKSUMS_FILE_NAME}");
 
     println!(
         "{}",
@@ -45,8 +48,10 @@ pub fn execute(cmd: UpdateCommand) -> Result<(), AppError> {
     );
     println!("{}", highlight(&format!("Updating to: {target_tag}")));
     println!("{}", info(&format!("Downloading: {download_url}")));
+    println!("{}", info(&format!("Verifying checksum: {checksum_url}")));
 
     let downloaded_archive = download_release_asset(&download_url, &asset_name)?;
+    verify_asset_checksum(&downloaded_archive, &checksum_url, &asset_name)?;
     let extracted_binary = extract_binary(&downloaded_archive)?;
     replace_current_binary(&extracted_binary)?;
 
@@ -146,6 +151,77 @@ fn download_release_asset(url: &str, asset_name: &str) -> Result<PathBuf, AppErr
         let archive_path = tmp_dir.join(asset_name);
         fs::write(&archive_path, &bytes).map_err(|e| AppError::io(&archive_path, e))?;
         Ok(archive_path)
+    })
+}
+
+fn verify_asset_checksum(
+    archive_path: &Path,
+    checksum_url: &str,
+    asset_name: &str,
+) -> Result<(), AppError> {
+    let checksum_content = run_async(download_text(checksum_url.to_string()))?;
+    let expected = parse_checksum_for_asset(&checksum_content, asset_name)?;
+
+    let data = fs::read(archive_path).map_err(|e| AppError::io(archive_path, e))?;
+    let actual = format!("{:x}", Sha256::digest(&data));
+
+    if actual != expected {
+        return Err(AppError::Message(format!(
+            "Checksum mismatch for {asset_name}: expected {expected}, got {actual}."
+        )));
+    }
+
+    Ok(())
+}
+
+async fn download_text(url: String) -> Result<String, AppError> {
+    reqwest::Client::builder()
+        .build()
+        .map_err(|e| AppError::Message(format!("Failed to initialize HTTP client: {e}")))?
+        .get(url)
+        .header(reqwest::header::USER_AGENT, "cc-switch-cli-updater")
+        .send()
+        .await
+        .map_err(|e| AppError::Message(format!("Failed to download checksum file: {e}")))?
+        .error_for_status()
+        .map_err(|e| AppError::Message(format!("Checksum file request failed: {e}")))?
+        .text()
+        .await
+        .map_err(|e| AppError::Message(format!("Failed to read checksum file body: {e}")))
+}
+
+fn parse_checksum_for_asset(checksum_content: &str, asset_name: &str) -> Result<String, AppError> {
+    let expected = checksum_content
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+
+            let mut parts = line.split_whitespace();
+            let hash = parts.next()?;
+            let mut file = parts.next()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            // sha256sum -b format can include a leading '*'
+            if let Some(stripped) = file.strip_prefix('*') {
+                file = stripped;
+            }
+
+            if file == asset_name {
+                Some(hash.to_string())
+            } else {
+                None
+            }
+        })
+        .next();
+
+    expected.ok_or_else(|| {
+        AppError::Message(format!(
+            "Unable to find SHA256 for {asset_name} in {CHECKSUMS_FILE_NAME}."
+        ))
     })
 }
 
@@ -261,7 +337,13 @@ fn replace_current_binary(new_binary_path: &Path) -> Result<(), AppError> {
         .map_err(|e| map_update_permission_error(&current_binary, e))?;
 
     if let Err(err) = fs::rename(&staged_binary, &current_binary) {
-        let _ = fs::rename(&backup_binary, &current_binary);
+        let restore_err = fs::rename(&backup_binary, &current_binary).err();
+        if let Some(restore_err) = restore_err {
+            return Err(AppError::Message(format!(
+                "Update failed while replacing binary: {err}. Rollback also failed: {restore_err}. Manual recovery needed from {}.",
+                backup_binary.display()
+            )));
+        }
         return Err(map_update_permission_error(&current_binary, err));
     }
 
@@ -291,5 +373,21 @@ mod tests {
     #[test]
     fn normalize_tag_keeps_existing_prefix() {
         assert_eq!(normalize_tag("v4.6.2"), "v4.6.2");
+    }
+
+    #[test]
+    fn parse_checksum_for_asset_finds_plain_filename() {
+        let checksums = "abc123  cc-switch-cli-linux-x64-musl.tar.gz\n";
+        let got = parse_checksum_for_asset(checksums, "cc-switch-cli-linux-x64-musl.tar.gz")
+            .expect("checksum should exist");
+        assert_eq!(got, "abc123");
+    }
+
+    #[test]
+    fn parse_checksum_for_asset_supports_star_prefix() {
+        let checksums = "def456 *cc-switch-cli-linux-x64-musl.tar.gz\n";
+        let got = parse_checksum_for_asset(checksums, "cc-switch-cli-linux-x64-musl.tar.gz")
+            .expect("checksum should exist");
+        assert_eq!(got, "def456");
     }
 }
