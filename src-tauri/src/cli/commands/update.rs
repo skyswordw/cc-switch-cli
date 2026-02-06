@@ -26,6 +26,16 @@ pub struct UpdateCommand {
 #[derive(Debug, Deserialize)]
 struct ReleaseInfo {
     tag_name: String,
+    #[serde(default)]
+    assets: Vec<ReleaseAsset>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct ReleaseAsset {
+    name: String,
+    browser_download_url: String,
+    #[serde(default)]
+    digest: Option<String>,
 }
 
 struct DownloadedAsset {
@@ -48,9 +58,15 @@ pub fn execute(cmd: UpdateCommand) -> Result<(), AppError> {
         return Ok(());
     }
 
-    let asset_name = release_asset_name()?;
-    let download_url = format!("{REPO_URL}/releases/download/{target_tag}/{asset_name}");
-    let checksum_url = format!("{REPO_URL}/releases/download/{target_tag}/{CHECKSUMS_FILE_NAME}");
+    let expected_asset_name = release_asset_name()?;
+    let release = runtime.block_on(fetch_release_by_tag(&client, &target_tag))?;
+    let release_asset = select_release_asset(&release.assets, &target_tag, &expected_asset_name)
+        .ok_or_else(|| {
+            AppError::Message(format!(
+                "Release {target_tag} does not include expected asset '{expected_asset_name}' (or compatible tagged variant)."
+            ))
+        })?;
+    let download_url = release_asset.browser_download_url.as_str();
 
     println!(
         "{}",
@@ -58,15 +74,25 @@ pub fn execute(cmd: UpdateCommand) -> Result<(), AppError> {
     );
     println!("{}", highlight(&format!("Updating to: {target_tag}")));
     println!("{}", info(&format!("Downloading: {download_url}")));
-    println!("{}", info(&format!("Verifying checksum: {checksum_url}")));
+    if release_asset.digest.is_some() {
+        println!(
+            "{}",
+            info("Verifying checksum from release metadata digest.")
+        );
+    } else {
+        let checksum_url =
+            format!("{REPO_URL}/releases/download/{target_tag}/{CHECKSUMS_FILE_NAME}");
+        println!("{}", info(&format!("Verifying checksum: {checksum_url}")));
+    }
 
-    let downloaded_asset = download_release_asset(&runtime, &client, &download_url, &asset_name)?;
+    let downloaded_asset =
+        download_release_asset(&runtime, &client, download_url, release_asset.name.as_str())?;
     verify_asset_checksum(
         &runtime,
         &client,
         &downloaded_asset.archive_path,
-        &checksum_url,
-        &asset_name,
+        &target_tag,
+        release_asset,
     )?;
     let extracted_binary = extract_binary(&downloaded_asset.archive_path)?;
     replace_current_binary(&extracted_binary)?;
@@ -144,7 +170,7 @@ fn normalize_tag(version: &str) -> String {
 }
 
 async fn fetch_latest_release_tag(client: &reqwest::Client) -> Result<String, AppError> {
-    let api_url = latest_release_api_url(REPO_URL)?;
+    let api_url = release_api_url(REPO_URL, "latest")?;
     let release = client
         .get(api_url)
         .header(reqwest::header::USER_AGENT, "cc-switch-cli-updater")
@@ -159,7 +185,25 @@ async fn fetch_latest_release_tag(client: &reqwest::Client) -> Result<String, Ap
     Ok(release.tag_name)
 }
 
-fn latest_release_api_url(repo_url: &str) -> Result<Url, AppError> {
+async fn fetch_release_by_tag(
+    client: &reqwest::Client,
+    tag: &str,
+) -> Result<ReleaseInfo, AppError> {
+    let api_url = release_api_url(REPO_URL, &format!("tags/{tag}"))?;
+    client
+        .get(api_url)
+        .header(reqwest::header::USER_AGENT, "cc-switch-cli-updater")
+        .send()
+        .await
+        .map_err(|e| AppError::Message(format!("Failed to query release {tag}: {e}")))?
+        .error_for_status()
+        .map_err(|e| AppError::Message(format!("Release API returned error for {tag}: {e}")))?
+        .json::<ReleaseInfo>()
+        .await
+        .map_err(|e| AppError::Message(format!("Failed to parse release response for {tag}: {e}")))
+}
+
+fn release_api_url(repo_url: &str, suffix: &str) -> Result<Url, AppError> {
     let repo_url = Url::parse(repo_url)
         .map_err(|e| AppError::Message(format!("Invalid repository URL '{repo_url}': {e}")))?;
     let host = repo_url
@@ -186,9 +230,9 @@ fn latest_release_api_url(repo_url: &str) -> Result<Url, AppError> {
     let repo = repo.strip_suffix(".git").unwrap_or(repo);
 
     let api_path = if host == "github.com" {
-        format!("/repos/{owner}/{repo}/releases/latest")
+        format!("/repos/{owner}/{repo}/releases/{suffix}")
     } else {
-        format!("/api/v3/repos/{owner}/{repo}/releases/latest")
+        format!("/api/v3/repos/{owner}/{repo}/releases/{suffix}")
     };
 
     let mut api_url = repo_url.clone();
@@ -202,6 +246,26 @@ fn latest_release_api_url(repo_url: &str) -> Result<Url, AppError> {
     api_url.set_fragment(None);
 
     Ok(api_url)
+}
+
+fn select_release_asset<'a>(
+    assets: &'a [ReleaseAsset],
+    target_tag: &str,
+    expected_asset_name: &str,
+) -> Option<&'a ReleaseAsset> {
+    let tagged_variant = tagged_asset_name(target_tag, expected_asset_name);
+
+    assets
+        .iter()
+        .find(|asset| asset.name == expected_asset_name)
+        .or_else(|| assets.iter().find(|asset| asset.name == tagged_variant))
+}
+
+fn tagged_asset_name(tag: &str, asset_name: &str) -> String {
+    if let Some(suffix) = asset_name.strip_prefix("cc-switch-cli-") {
+        return format!("cc-switch-cli-{tag}-{suffix}");
+    }
+    asset_name.to_string()
 }
 
 fn release_asset_name() -> Result<String, AppError> {
@@ -266,17 +330,28 @@ fn verify_asset_checksum(
     runtime: &tokio::runtime::Runtime,
     client: &reqwest::Client,
     archive_path: &Path,
-    checksum_url: &str,
-    asset_name: &str,
+    target_tag: &str,
+    release_asset: &ReleaseAsset,
 ) -> Result<(), AppError> {
-    let checksum_content = runtime.block_on(download_text(client, checksum_url))?;
-    let expected = parse_checksum_for_asset(&checksum_content, asset_name)?;
-
     let actual = compute_sha256_hex(archive_path)?;
+
+    let expected = if let Some(expected) = release_asset
+        .digest
+        .as_deref()
+        .and_then(parse_sha256_digest)
+    {
+        expected
+    } else {
+        let checksum_url =
+            format!("{REPO_URL}/releases/download/{target_tag}/{CHECKSUMS_FILE_NAME}");
+        let checksum_content = runtime.block_on(download_text(client, &checksum_url))?;
+        parse_checksum_for_asset(&checksum_content, release_asset.name.as_str())?
+    };
 
     if actual != expected {
         return Err(AppError::Message(format!(
-            "Checksum mismatch for {asset_name}: expected {expected}, got {actual}."
+            "Checksum mismatch for {}: expected {expected}, got {actual}.",
+            release_asset.name
         )));
     }
 
@@ -360,6 +435,14 @@ fn parse_sha256sum_line(line: &str) -> Option<(&str, &str)> {
     }
 
     None
+}
+
+fn parse_sha256_digest(digest: &str) -> Option<String> {
+    let digest = digest.strip_prefix("sha256:")?;
+    if digest.len() != 64 || !digest.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(digest.to_ascii_lowercase())
 }
 
 fn extract_binary(archive_path: &Path) -> Result<PathBuf, AppError> {
@@ -543,8 +626,8 @@ mod tests {
     }
 
     #[test]
-    fn latest_release_api_url_for_github_com() {
-        let url = latest_release_api_url("https://github.com/saladday/cc-switch-cli")
+    fn release_api_url_for_github_com() {
+        let url = release_api_url("https://github.com/saladday/cc-switch-cli", "latest")
             .expect("api url should be built");
         assert_eq!(
             url.as_str(),
@@ -553,12 +636,60 @@ mod tests {
     }
 
     #[test]
-    fn latest_release_api_url_for_github_enterprise() {
-        let url = latest_release_api_url("https://github.enterprise.local/team/cc-switch-cli.git")
-            .expect("api url should be built");
+    fn release_api_url_for_github_enterprise() {
+        let url = release_api_url(
+            "https://github.enterprise.local/team/cc-switch-cli.git",
+            "tags/v4.6.2",
+        )
+        .expect("api url should be built");
         assert_eq!(
             url.as_str(),
-            "https://github.enterprise.local/api/v3/repos/team/cc-switch-cli/releases/latest"
+            "https://github.enterprise.local/api/v3/repos/team/cc-switch-cli/releases/tags/v4.6.2"
+        );
+    }
+
+    #[test]
+    fn select_release_asset_prefers_unprefixed_name() {
+        let assets = vec![
+            ReleaseAsset {
+                name: "cc-switch-cli-v4.6.2-linux-x64-musl.tar.gz".to_string(),
+                browser_download_url: "https://example.com/tagged".to_string(),
+                digest: None,
+            },
+            ReleaseAsset {
+                name: "cc-switch-cli-linux-x64-musl.tar.gz".to_string(),
+                browser_download_url: "https://example.com/plain".to_string(),
+                digest: None,
+            },
+        ];
+        let selected =
+            select_release_asset(&assets, "v4.6.2", "cc-switch-cli-linux-x64-musl.tar.gz")
+                .expect("asset should be selected");
+        assert_eq!(selected.browser_download_url, "https://example.com/plain");
+    }
+
+    #[test]
+    fn select_release_asset_falls_back_to_tagged_variant() {
+        let assets = vec![ReleaseAsset {
+            name: "cc-switch-cli-v4.6.2-linux-x64-musl.tar.gz".to_string(),
+            browser_download_url: "https://example.com/tagged".to_string(),
+            digest: None,
+        }];
+        let selected =
+            select_release_asset(&assets, "v4.6.2", "cc-switch-cli-linux-x64-musl.tar.gz")
+                .expect("asset should be selected");
+        assert_eq!(selected.browser_download_url, "https://example.com/tagged");
+    }
+
+    #[test]
+    fn parse_sha256_digest_accepts_valid_value() {
+        let digest = parse_sha256_digest(
+            "sha256:ABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCD",
+        )
+        .expect("digest should parse");
+        assert_eq!(
+            digest,
+            "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
         );
     }
 
