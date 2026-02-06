@@ -53,10 +53,14 @@ struct DownloadedAsset {
 
 pub fn execute(cmd: UpdateCommand) -> Result<(), AppError> {
     let runtime = create_runtime()?;
+    runtime.block_on(execute_async(cmd))
+}
+
+async fn execute_async(cmd: UpdateCommand) -> Result<(), AppError> {
     let current_version = env!("CARGO_PKG_VERSION");
     let explicit_version = cmd.version.as_deref().is_some_and(|v| !v.trim().is_empty());
     let client = create_http_client()?;
-    let target_tag = resolve_target_tag(&runtime, &client, cmd.version.as_deref())?;
+    let target_tag = resolve_target_tag(&client, cmd.version.as_deref()).await?;
     let target_version = target_tag.trim_start_matches('v');
 
     if target_version == current_version {
@@ -78,7 +82,7 @@ pub fn execute(cmd: UpdateCommand) -> Result<(), AppError> {
     }
 
     let expected_asset_name = release_asset_name()?;
-    let release = runtime.block_on(fetch_release_by_tag(&client, &target_tag))?;
+    let release = fetch_release_by_tag(&client, &target_tag).await?;
     let release_asset = select_release_asset(&release.assets, &target_tag, &expected_asset_name)
         .ok_or_else(|| {
             AppError::Message(format!(
@@ -105,14 +109,14 @@ pub fn execute(cmd: UpdateCommand) -> Result<(), AppError> {
     }
 
     let downloaded_asset =
-        download_release_asset(&runtime, &client, download_url, release_asset.name.as_str())?;
+        download_release_asset(&client, download_url, release_asset.name.as_str()).await?;
     verify_asset_checksum(
-        &runtime,
         &client,
         &downloaded_asset.archive_path,
         &target_tag,
         release_asset,
-    )?;
+    )
+    .await?;
     let extracted_binary = extract_binary(&downloaded_asset.archive_path)?;
     replace_current_binary(&extracted_binary)?;
 
@@ -141,14 +145,13 @@ fn create_http_client() -> Result<reqwest::Client, AppError> {
         .map_err(|e| AppError::Message(format!("Failed to initialize HTTP client: {e}")))
 }
 
-fn resolve_target_tag(
-    runtime: &tokio::runtime::Runtime,
+async fn resolve_target_tag(
     client: &reqwest::Client,
     version: Option<&str>,
 ) -> Result<String, AppError> {
     let tag = match version.map(str::trim).filter(|v| !v.is_empty()) {
         Some(version) => normalize_tag(version),
-        None => runtime.block_on(fetch_latest_release_tag(client))?,
+        None => fetch_latest_release_tag(client).await?,
     };
     validate_target_tag(&tag)?;
     Ok(tag)
@@ -307,49 +310,45 @@ fn release_asset_name() -> Result<String, AppError> {
     Ok(name.to_string())
 }
 
-fn download_release_asset(
-    runtime: &tokio::runtime::Runtime,
+async fn download_release_asset(
     client: &reqwest::Client,
     url: &str,
     asset_name: &str,
 ) -> Result<DownloadedAsset, AppError> {
-    runtime.block_on(async move {
-        let mut response = client
-            .get(url)
-            .header(reqwest::header::USER_AGENT, USER_AGENT)
-            .send()
-            .await
-            .map_err(|e| AppError::Message(format!("Failed to download release asset: {e}")))?
-            .error_for_status()
-            .map_err(|e| AppError::Message(format!("Release asset request failed: {e}")))?;
-        if let Some(content_length) = response.content_length() {
-            validate_download_size_limit(content_length, asset_name)?;
-        }
+    let mut response = client
+        .get(url)
+        .header(reqwest::header::USER_AGENT, USER_AGENT)
+        .send()
+        .await
+        .map_err(|e| AppError::Message(format!("Failed to download release asset: {e}")))?
+        .error_for_status()
+        .map_err(|e| AppError::Message(format!("Release asset request failed: {e}")))?;
+    if let Some(content_length) = response.content_length() {
+        validate_download_size_limit(content_length, asset_name)?;
+    }
 
-        let temp_dir = tempfile::tempdir()
-            .map_err(|e| AppError::Message(format!("Failed to create temp directory: {e}")))?;
-        let file_name = sanitized_asset_file_name(asset_name)?;
-        let archive_path = temp_dir.path().join(file_name);
-        let mut output =
-            fs::File::create(&archive_path).map_err(|e| AppError::io(&archive_path, e))?;
-        let mut downloaded_bytes = 0_u64;
+    let temp_dir = tempfile::tempdir()
+        .map_err(|e| AppError::Message(format!("Failed to create temp directory: {e}")))?;
+    let file_name = sanitized_asset_file_name(asset_name)?;
+    let archive_path = temp_dir.path().join(file_name);
+    let mut output = fs::File::create(&archive_path).map_err(|e| AppError::io(&archive_path, e))?;
+    let mut downloaded_bytes = 0_u64;
 
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|e| AppError::Message(format!("Failed to read release asset chunk: {e}")))?
-        {
-            downloaded_bytes = downloaded_bytes.saturating_add(chunk.len() as u64);
-            validate_download_size_limit(downloaded_bytes, asset_name)?;
-            output
-                .write_all(&chunk)
-                .map_err(|e| AppError::io(&archive_path, e))?;
-        }
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| AppError::Message(format!("Failed to read release asset chunk: {e}")))?
+    {
+        downloaded_bytes = downloaded_bytes.saturating_add(chunk.len() as u64);
+        validate_download_size_limit(downloaded_bytes, asset_name)?;
+        output
+            .write_all(&chunk)
+            .map_err(|e| AppError::io(&archive_path, e))?;
+    }
 
-        Ok(DownloadedAsset {
-            _temp_dir: temp_dir,
-            archive_path,
-        })
+    Ok(DownloadedAsset {
+        _temp_dir: temp_dir,
+        archive_path,
     })
 }
 
@@ -371,8 +370,7 @@ fn validate_download_size_limit(size_bytes: u64, asset_name: &str) -> Result<(),
     )))
 }
 
-fn verify_asset_checksum(
-    runtime: &tokio::runtime::Runtime,
+async fn verify_asset_checksum(
     client: &reqwest::Client,
     archive_path: &Path,
     target_tag: &str,
@@ -389,7 +387,7 @@ fn verify_asset_checksum(
     } else {
         let checksum_url =
             format!("{REPO_URL}/releases/download/{target_tag}/{CHECKSUMS_FILE_NAME}");
-        let checksum_content = runtime.block_on(download_text(client, &checksum_url))?;
+        let checksum_content = download_text(client, &checksum_url).await?;
         parse_checksum_for_asset(&checksum_content, release_asset.name.as_str())?
     };
 
@@ -481,10 +479,10 @@ fn parse_sha256sum_line(line: &str) -> Option<(&str, &str)> {
         return None;
     }
 
-    if let Some(file) = remainder.strip_prefix("  ") {
-        return Some((hash, file));
-    }
-    if let Some(file) = remainder.strip_prefix(" *") {
+    if let Some(file) = remainder
+        .strip_prefix("  ")
+        .or_else(|| remainder.strip_prefix(" *"))
+    {
         return Some((hash, file));
     }
 
