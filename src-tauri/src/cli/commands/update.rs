@@ -310,7 +310,8 @@ fn download_release_asset(
 
         let temp_dir = tempfile::tempdir()
             .map_err(|e| AppError::Message(format!("Failed to create temp directory: {e}")))?;
-        let archive_path = temp_dir.path().join(asset_name);
+        let file_name = sanitized_asset_file_name(asset_name)?;
+        let archive_path = temp_dir.path().join(file_name);
         let mut output =
             fs::File::create(&archive_path).map_err(|e| AppError::io(&archive_path, e))?;
 
@@ -329,6 +330,13 @@ fn download_release_asset(
             archive_path,
         })
     })
+}
+
+fn sanitized_asset_file_name(asset_name: &str) -> Result<&str, AppError> {
+    Path::new(asset_name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| AppError::Message(format!("Invalid asset name: {asset_name}")))
 }
 
 fn verify_asset_checksum(
@@ -469,25 +477,44 @@ fn extract_tar_binary(archive_path: &Path, extract_dir: &Path) -> Result<PathBuf
     let file = fs::File::open(archive_path).map_err(|e| AppError::io(archive_path, e))?;
     let decoder = GzDecoder::new(file);
     let mut archive = Archive::new(decoder);
-    archive
-        .unpack(extract_dir)
-        .map_err(|e| AppError::Message(format!("Failed to extract release archive: {e}")))?;
+    let entries = archive
+        .entries()
+        .map_err(|e| AppError::Message(format!("Failed to read archive entries: {e}")))?;
 
-    let binary_path = extract_dir.join(BINARY_NAME);
-    if !binary_path.exists() {
-        return Err(AppError::Message(format!(
-            "Extracted archive does not contain expected binary: {BINARY_NAME}"
-        )));
+    for entry in entries {
+        let mut entry =
+            entry.map_err(|e| AppError::Message(format!("Failed to read archive entry: {e}")))?;
+
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+
+        let entry_path = entry
+            .path()
+            .map_err(|e| AppError::Message(format!("Failed to inspect archive entry path: {e}")))?;
+        if entry_path.file_name().and_then(|name| name.to_str()) != Some(BINARY_NAME) {
+            continue;
+        }
+
+        let binary_path = extract_dir.join(BINARY_NAME);
+        let mut output =
+            fs::File::create(&binary_path).map_err(|e| AppError::io(&binary_path, e))?;
+        std::io::copy(&mut entry, &mut output)
+            .map_err(|e| AppError::Message(format!("Failed to unpack binary from TAR: {e}")))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = fs::Permissions::from_mode(0o755);
+            fs::set_permissions(&binary_path, perms).map_err(|e| AppError::io(&binary_path, e))?;
+        }
+
+        return Ok(binary_path);
     }
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = fs::Permissions::from_mode(0o755);
-        fs::set_permissions(&binary_path, perms).map_err(|e| AppError::io(&binary_path, e))?;
-    }
-
-    Ok(binary_path)
+    Err(AppError::Message(format!(
+        "Extracted archive does not contain expected binary: {BINARY_NAME}"
+    )))
 }
 
 #[cfg(not(windows))]
@@ -524,50 +551,62 @@ fn extract_tar_binary(_archive_path: &Path, _extract_dir: &Path) -> Result<PathB
 }
 
 fn replace_current_binary(new_binary_path: &Path) -> Result<(), AppError> {
-    let current_binary = std::env::current_exe().map_err(|e| {
-        AppError::Message(format!("Failed to resolve current executable path: {e}"))
-    })?;
-    let parent = current_binary.parent().ok_or_else(|| {
-        AppError::Message("Current executable path has no parent directory.".to_string())
-    })?;
-
-    let staged_binary = parent.join(format!("{BINARY_NAME}.new"));
-    let backup_binary = parent.join(format!("{BINARY_NAME}.old"));
-
-    if backup_binary.exists() {
-        fs::remove_file(&backup_binary).map_err(|e| AppError::io(&backup_binary, e))?;
-    }
-    if staged_binary.exists() {
-        fs::remove_file(&staged_binary).map_err(|e| AppError::io(&staged_binary, e))?;
-    }
-
-    fs::copy(new_binary_path, &staged_binary)
-        .map_err(|e| map_update_permission_error(&current_binary, e))?;
-
-    #[cfg(unix)]
+    #[cfg(windows)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = fs::Permissions::from_mode(0o755);
-        fs::set_permissions(&staged_binary, perms)
-            .map_err(|e| map_update_permission_error(&current_binary, e))?;
+        return self_replace::self_replace(new_binary_path).map_err(|e| {
+            AppError::Message(format!(
+                "Failed to replace running executable on Windows: {e}"
+            ))
+        });
     }
 
-    fs::rename(&current_binary, &backup_binary)
-        .map_err(|e| map_update_permission_error(&current_binary, e))?;
+    #[cfg(not(windows))]
+    {
+        let current_binary = std::env::current_exe().map_err(|e| {
+            AppError::Message(format!("Failed to resolve current executable path: {e}"))
+        })?;
+        let parent = current_binary.parent().ok_or_else(|| {
+            AppError::Message("Current executable path has no parent directory.".to_string())
+        })?;
 
-    if let Err(err) = fs::rename(&staged_binary, &current_binary) {
-        let restore_err = fs::rename(&backup_binary, &current_binary).err();
-        if let Some(restore_err) = restore_err {
-            return Err(AppError::Message(format!(
+        let staged_binary = parent.join(format!("{BINARY_NAME}.new"));
+        let backup_binary = parent.join(format!("{BINARY_NAME}.old"));
+
+        if backup_binary.exists() {
+            fs::remove_file(&backup_binary).map_err(|e| AppError::io(&backup_binary, e))?;
+        }
+        if staged_binary.exists() {
+            fs::remove_file(&staged_binary).map_err(|e| AppError::io(&staged_binary, e))?;
+        }
+
+        fs::copy(new_binary_path, &staged_binary)
+            .map_err(|e| map_update_permission_error(&current_binary, e))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = fs::Permissions::from_mode(0o755);
+            fs::set_permissions(&staged_binary, perms)
+                .map_err(|e| map_update_permission_error(&current_binary, e))?;
+        }
+
+        fs::rename(&current_binary, &backup_binary)
+            .map_err(|e| map_update_permission_error(&current_binary, e))?;
+
+        if let Err(err) = fs::rename(&staged_binary, &current_binary) {
+            let restore_err = fs::rename(&backup_binary, &current_binary).err();
+            if let Some(restore_err) = restore_err {
+                return Err(AppError::Message(format!(
                 "Update failed while replacing binary: {err}. Rollback also failed: {restore_err}. Manual recovery needed from {}.",
                 backup_binary.display()
             )));
+            }
+            return Err(map_update_permission_error(&current_binary, err));
         }
-        return Err(map_update_permission_error(&current_binary, err));
-    }
 
-    let _ = fs::remove_file(&backup_binary);
-    Ok(())
+        let _ = fs::remove_file(&backup_binary);
+        Ok(())
+    }
 }
 
 fn map_update_permission_error(target: &Path, err: std::io::Error) -> AppError {
@@ -696,6 +735,19 @@ mod tests {
             digest,
             "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
         );
+    }
+
+    #[test]
+    fn sanitized_asset_file_name_strips_path_segments() {
+        let name = sanitized_asset_file_name("nested/path/cc-switch-cli-linux-x64-musl.tar.gz")
+            .expect("file name should be extracted");
+        assert_eq!(name, "cc-switch-cli-linux-x64-musl.tar.gz");
+    }
+
+    #[test]
+    fn sanitized_asset_file_name_rejects_invalid_value() {
+        let err = sanitized_asset_file_name("").expect_err("empty name should fail");
+        assert!(err.to_string().contains("Invalid asset name"));
     }
 
     #[test]

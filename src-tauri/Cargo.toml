@@ -75,6 +75,7 @@ unicode-width = "0.1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.52"
+self-replace = "1"
 
 # Optimize release binary size to help reduce AppImage footprint
 [profile.release]
