@@ -1,9 +1,10 @@
 use clap::Args;
 use flate2::read::GzDecoder;
+use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use tar::Archive;
 use tempfile::TempDir;
@@ -51,6 +52,7 @@ struct DownloadedAsset {
 pub fn execute(cmd: UpdateCommand) -> Result<(), AppError> {
     let runtime = create_runtime()?;
     let current_version = env!("CARGO_PKG_VERSION");
+    let explicit_version = cmd.version.as_deref().is_some_and(|v| !v.trim().is_empty());
     let client = create_http_client()?;
     let target_tag = resolve_target_tag(&runtime, &client, cmd.version.as_deref())?;
     let target_version = target_tag.trim_start_matches('v');
@@ -59,6 +61,16 @@ pub fn execute(cmd: UpdateCommand) -> Result<(), AppError> {
         println!(
             "{}",
             info(&format!("Already on latest version: v{current_version}"))
+        );
+        return Ok(());
+    }
+
+    if should_skip_implicit_downgrade(current_version, target_version, explicit_version) {
+        println!(
+            "{}",
+            info(&format!(
+                "Current version v{current_version} is newer than target {target_tag}; skipping automatic downgrade. Use `cc-switch update --version {target_tag}` to force."
+            ))
         );
         return Ok(());
     }
@@ -374,17 +386,26 @@ fn verify_asset_checksum(
 fn compute_sha256_hex(path: &Path) -> Result<String, AppError> {
     let mut file = fs::File::open(path).map_err(|e| AppError::io(path, e))?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 8192];
-
-    loop {
-        let n = file.read(&mut buffer).map_err(|e| AppError::io(path, e))?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buffer[..n]);
-    }
+    std::io::copy(&mut file, &mut hasher).map_err(|e| AppError::io(path, e))?;
 
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn should_skip_implicit_downgrade(
+    current_version: &str,
+    target_version: &str,
+    explicit_version: bool,
+) -> bool {
+    if explicit_version {
+        return false;
+    }
+    let Ok(current) = Version::parse(current_version) else {
+        return false;
+    };
+    let Ok(target) = Version::parse(target_version) else {
+        return false;
+    };
+    target < current
 }
 
 async fn download_text(client: &reqwest::Client, url: &str) -> Result<String, AppError> {
@@ -735,6 +756,24 @@ mod tests {
             digest,
             "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
         );
+    }
+
+    #[test]
+    fn should_skip_implicit_downgrade_for_prerelease_current() {
+        assert!(should_skip_implicit_downgrade(
+            "4.7.0-alpha.1",
+            "4.6.2",
+            false
+        ));
+    }
+
+    #[test]
+    fn should_not_skip_when_version_explicitly_requested() {
+        assert!(!should_skip_implicit_downgrade(
+            "4.7.0-alpha.1",
+            "4.6.2",
+            true
+        ));
     }
 
     #[test]
