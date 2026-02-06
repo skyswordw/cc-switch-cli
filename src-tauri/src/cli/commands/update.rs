@@ -1,11 +1,11 @@
 use clap::Args;
+use flate2::read::GzDecoder;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-#[cfg(not(windows))]
-use std::process::Command;
+use tar::Archive;
 use tempfile::TempDir;
 
 use crate::cli::ui::{highlight, info, success};
@@ -34,7 +34,8 @@ struct DownloadedAsset {
 
 pub fn execute(cmd: UpdateCommand) -> Result<(), AppError> {
     let current_version = env!("CARGO_PKG_VERSION");
-    let target_tag = resolve_target_tag(cmd.version.as_deref())?;
+    let client = create_http_client()?;
+    let target_tag = resolve_target_tag(&client, cmd.version.as_deref())?;
     let target_version = target_tag.trim_start_matches('v');
 
     if target_version == current_version {
@@ -57,8 +58,13 @@ pub fn execute(cmd: UpdateCommand) -> Result<(), AppError> {
     println!("{}", info(&format!("Downloading: {download_url}")));
     println!("{}", info(&format!("Verifying checksum: {checksum_url}")));
 
-    let downloaded_asset = download_release_asset(&download_url, &asset_name)?;
-    verify_asset_checksum(&downloaded_asset.archive_path, &checksum_url, &asset_name)?;
+    let downloaded_asset = download_release_asset(&client, &download_url, &asset_name)?;
+    verify_asset_checksum(
+        &client,
+        &downloaded_asset.archive_path,
+        &checksum_url,
+        &asset_name,
+    )?;
     let extracted_binary = extract_binary(&downloaded_asset.archive_path)?;
     replace_current_binary(&extracted_binary)?;
 
@@ -83,10 +89,16 @@ fn run_async<T>(
         .block_on(fut)
 }
 
-fn resolve_target_tag(version: Option<&str>) -> Result<String, AppError> {
+fn create_http_client() -> Result<reqwest::Client, AppError> {
+    reqwest::Client::builder()
+        .build()
+        .map_err(|e| AppError::Message(format!("Failed to initialize HTTP client: {e}")))
+}
+
+fn resolve_target_tag(client: &reqwest::Client, version: Option<&str>) -> Result<String, AppError> {
     let tag = match version.map(str::trim).filter(|v| !v.is_empty()) {
         Some(version) => normalize_tag(version),
-        None => run_async(fetch_latest_release_tag())?,
+        None => run_async(fetch_latest_release_tag(client))?,
     };
     validate_target_tag(&tag)?;
     Ok(tag)
@@ -127,12 +139,9 @@ fn normalize_tag(version: &str) -> String {
     }
 }
 
-async fn fetch_latest_release_tag() -> Result<String, AppError> {
+async fn fetch_latest_release_tag(client: &reqwest::Client) -> Result<String, AppError> {
     let api_url =
         format!("{REPO_URL}/releases/latest").replace("github.com", "api.github.com/repos");
-    let client = reqwest::Client::builder()
-        .build()
-        .map_err(|e| AppError::Message(format!("Failed to initialize HTTP client: {e}")))?;
     let release = client
         .get(api_url)
         .header(reqwest::header::USER_AGENT, "cc-switch-cli-updater")
@@ -166,26 +175,37 @@ fn release_asset_name() -> Result<String, AppError> {
     Ok(name.to_string())
 }
 
-fn download_release_asset(url: &str, asset_name: &str) -> Result<DownloadedAsset, AppError> {
+fn download_release_asset(
+    client: &reqwest::Client,
+    url: &str,
+    asset_name: &str,
+) -> Result<DownloadedAsset, AppError> {
     run_async(async move {
-        let bytes = reqwest::Client::builder()
-            .build()
-            .map_err(|e| AppError::Message(format!("Failed to initialize HTTP client: {e}")))?
+        let mut response = client
             .get(url)
             .header(reqwest::header::USER_AGENT, "cc-switch-cli-updater")
             .send()
             .await
             .map_err(|e| AppError::Message(format!("Failed to download release asset: {e}")))?
             .error_for_status()
-            .map_err(|e| AppError::Message(format!("Release asset request failed: {e}")))?
-            .bytes()
-            .await
-            .map_err(|e| AppError::Message(format!("Failed to read release asset body: {e}")))?;
+            .map_err(|e| AppError::Message(format!("Release asset request failed: {e}")))?;
 
         let temp_dir = tempfile::tempdir()
             .map_err(|e| AppError::Message(format!("Failed to create temp directory: {e}")))?;
         let archive_path = temp_dir.path().join(asset_name);
-        fs::write(&archive_path, &bytes).map_err(|e| AppError::io(&archive_path, e))?;
+        let mut output =
+            fs::File::create(&archive_path).map_err(|e| AppError::io(&archive_path, e))?;
+
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| AppError::Message(format!("Failed to read release asset chunk: {e}")))?
+        {
+            output
+                .write_all(&chunk)
+                .map_err(|e| AppError::io(&archive_path, e))?;
+        }
+
         Ok(DownloadedAsset {
             _temp_dir: temp_dir,
             archive_path,
@@ -194,11 +214,12 @@ fn download_release_asset(url: &str, asset_name: &str) -> Result<DownloadedAsset
 }
 
 fn verify_asset_checksum(
+    client: &reqwest::Client,
     archive_path: &Path,
     checksum_url: &str,
     asset_name: &str,
 ) -> Result<(), AppError> {
-    let checksum_content = run_async(download_text(checksum_url.to_string()))?;
+    let checksum_content = run_async(download_text(client, checksum_url))?;
     let expected = parse_checksum_for_asset(&checksum_content, asset_name)?;
 
     let actual = compute_sha256_hex(archive_path)?;
@@ -228,10 +249,8 @@ fn compute_sha256_hex(path: &Path) -> Result<String, AppError> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-async fn download_text(url: String) -> Result<String, AppError> {
-    reqwest::Client::builder()
-        .build()
-        .map_err(|e| AppError::Message(format!("Failed to initialize HTTP client: {e}")))?
+async fn download_text(client: &reqwest::Client, url: &str) -> Result<String, AppError> {
+    client
         .get(url)
         .header(reqwest::header::USER_AGENT, "cc-switch-cli-updater")
         .send()
@@ -295,19 +314,12 @@ fn extract_binary(archive_path: &Path) -> Result<PathBuf, AppError> {
 
 #[cfg(not(windows))]
 fn extract_tar_binary(archive_path: &Path, extract_dir: &Path) -> Result<PathBuf, AppError> {
-    let status = Command::new("tar")
-        .arg("-xzf")
-        .arg(archive_path)
-        .arg("-C")
-        .arg(extract_dir)
-        .status()
-        .map_err(|e| AppError::Message(format!("Failed to run tar for extraction: {e}")))?;
-
-    if !status.success() {
-        return Err(AppError::Message(
-            "Failed to extract release archive with tar.".to_string(),
-        ));
-    }
+    let file = fs::File::open(archive_path).map_err(|e| AppError::io(archive_path, e))?;
+    let decoder = GzDecoder::new(file);
+    let mut archive = Archive::new(decoder);
+    archive
+        .unpack(extract_dir)
+        .map_err(|e| AppError::Message(format!("Failed to extract release archive: {e}")))?;
 
     let binary_path = extract_dir.join(BINARY_NAME);
     if !binary_path.exists() {
