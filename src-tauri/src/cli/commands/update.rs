@@ -611,37 +611,21 @@ fn replace_current_binary(new_binary_path: &Path) -> Result<(), AppError> {
         })?;
 
         let staged_binary = parent.join(format!("{BINARY_NAME}.new"));
-        let backup_binary = parent.join(format!("{BINARY_NAME}.old"));
-
-        remove_file_if_present(&backup_binary)?;
         remove_file_if_present(&staged_binary)?;
 
         fs::copy(new_binary_path, &staged_binary)
-            .map_err(|e| map_update_permission_error(&current_binary, e))?;
+            .map_err(|e| map_update_permission_error(&staged_binary, e))?;
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let perms = fs::Permissions::from_mode(0o755);
             fs::set_permissions(&staged_binary, perms)
-                .map_err(|e| map_update_permission_error(&current_binary, e))?;
+                .map_err(|e| map_update_permission_error(&staged_binary, e))?;
         }
 
-        fs::rename(&current_binary, &backup_binary)
+        fs::rename(&staged_binary, &current_binary)
             .map_err(|e| map_update_permission_error(&current_binary, e))?;
-
-        if let Err(err) = fs::rename(&staged_binary, &current_binary) {
-            let restore_err = fs::rename(&backup_binary, &current_binary).err();
-            if let Some(restore_err) = restore_err {
-                return Err(AppError::Message(format!(
-                "Update failed while replacing binary: {err}. Rollback also failed: {restore_err}. Manual recovery needed from {}.",
-                backup_binary.display()
-            )));
-            }
-            return Err(map_update_permission_error(&current_binary, err));
-        }
-
-        let _ = fs::remove_file(&backup_binary);
         Ok(())
     }
 }
