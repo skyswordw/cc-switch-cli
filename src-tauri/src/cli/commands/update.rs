@@ -15,6 +15,11 @@ use crate::error::AppError;
 const REPO_URL: &str = env!("CARGO_PKG_REPOSITORY");
 const BINARY_NAME: &str = "cc-switch";
 const CHECKSUMS_FILE_NAME: &str = "checksums.txt";
+const USER_AGENT: &str = concat!(
+    env!("CARGO_PKG_NAME"),
+    "-updater/",
+    env!("CARGO_PKG_VERSION")
+);
 
 #[derive(Args, Debug, Clone)]
 pub struct UpdateCommand {
@@ -173,7 +178,7 @@ async fn fetch_latest_release_tag(client: &reqwest::Client) -> Result<String, Ap
     let api_url = release_api_url(REPO_URL, "latest")?;
     let release = client
         .get(api_url)
-        .header(reqwest::header::USER_AGENT, "cc-switch-cli-updater")
+        .header(reqwest::header::USER_AGENT, USER_AGENT)
         .send()
         .await
         .map_err(|e| AppError::Message(format!("Failed to query latest release: {e}")))?
@@ -192,7 +197,7 @@ async fn fetch_release_by_tag(
     let api_url = release_api_url(REPO_URL, &format!("tags/{tag}"))?;
     client
         .get(api_url)
-        .header(reqwest::header::USER_AGENT, "cc-switch-cli-updater")
+        .header(reqwest::header::USER_AGENT, USER_AGENT)
         .send()
         .await
         .map_err(|e| AppError::Message(format!("Failed to query release {tag}: {e}")))?
@@ -296,7 +301,7 @@ fn download_release_asset(
     runtime.block_on(async move {
         let mut response = client
             .get(url)
-            .header(reqwest::header::USER_AGENT, "cc-switch-cli-updater")
+            .header(reqwest::header::USER_AGENT, USER_AGENT)
             .send()
             .await
             .map_err(|e| AppError::Message(format!("Failed to download release asset: {e}")))?
@@ -377,7 +382,7 @@ fn compute_sha256_hex(path: &Path) -> Result<String, AppError> {
 async fn download_text(client: &reqwest::Client, url: &str) -> Result<String, AppError> {
     client
         .get(url)
-        .header(reqwest::header::USER_AGENT, "cc-switch-cli-updater")
+        .header(reqwest::header::USER_AGENT, USER_AGENT)
         .send()
         .await
         .map_err(|e| AppError::Message(format!("Failed to download checksum file: {e}")))?
