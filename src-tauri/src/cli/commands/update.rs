@@ -16,6 +16,8 @@ use crate::error::AppError;
 const REPO_URL: &str = env!("CARGO_PKG_REPOSITORY");
 const BINARY_NAME: &str = "cc-switch";
 const CHECKSUMS_FILE_NAME: &str = "checksums.txt";
+const HTTP_REQUEST_TIMEOUT_SECS: u64 = 30;
+const MAX_RELEASE_ASSET_SIZE_BYTES: u64 = 100 * 1024 * 1024;
 const USER_AGENT: &str = concat!(
     env!("CARGO_PKG_NAME"),
     "-updater/",
@@ -134,6 +136,7 @@ fn create_runtime() -> Result<tokio::runtime::Runtime, AppError> {
 
 fn create_http_client() -> Result<reqwest::Client, AppError> {
     reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(HTTP_REQUEST_TIMEOUT_SECS))
         .build()
         .map_err(|e| AppError::Message(format!("Failed to initialize HTTP client: {e}")))
 }
@@ -319,6 +322,9 @@ fn download_release_asset(
             .map_err(|e| AppError::Message(format!("Failed to download release asset: {e}")))?
             .error_for_status()
             .map_err(|e| AppError::Message(format!("Release asset request failed: {e}")))?;
+        if let Some(content_length) = response.content_length() {
+            validate_download_size_limit(content_length, asset_name)?;
+        }
 
         let temp_dir = tempfile::tempdir()
             .map_err(|e| AppError::Message(format!("Failed to create temp directory: {e}")))?;
@@ -326,12 +332,15 @@ fn download_release_asset(
         let archive_path = temp_dir.path().join(file_name);
         let mut output =
             fs::File::create(&archive_path).map_err(|e| AppError::io(&archive_path, e))?;
+        let mut downloaded_bytes = 0_u64;
 
         while let Some(chunk) = response
             .chunk()
             .await
             .map_err(|e| AppError::Message(format!("Failed to read release asset chunk: {e}")))?
         {
+            downloaded_bytes = downloaded_bytes.saturating_add(chunk.len() as u64);
+            validate_download_size_limit(downloaded_bytes, asset_name)?;
             output
                 .write_all(&chunk)
                 .map_err(|e| AppError::io(&archive_path, e))?;
@@ -349,6 +358,17 @@ fn sanitized_asset_file_name(asset_name: &str) -> Result<&str, AppError> {
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| AppError::Message(format!("Invalid asset name: {asset_name}")))
+}
+
+fn validate_download_size_limit(size_bytes: u64, asset_name: &str) -> Result<(), AppError> {
+    if size_bytes <= MAX_RELEASE_ASSET_SIZE_BYTES {
+        return Ok(());
+    }
+    let max_mb = MAX_RELEASE_ASSET_SIZE_BYTES / (1024 * 1024);
+    let size_mb = size_bytes / (1024 * 1024);
+    Err(AppError::Message(format!(
+        "Release asset '{asset_name}' is too large ({size_mb} MB). Maximum allowed size is {max_mb} MB."
+    )))
 }
 
 fn verify_asset_checksum(
@@ -593,12 +613,8 @@ fn replace_current_binary(new_binary_path: &Path) -> Result<(), AppError> {
         let staged_binary = parent.join(format!("{BINARY_NAME}.new"));
         let backup_binary = parent.join(format!("{BINARY_NAME}.old"));
 
-        if backup_binary.exists() {
-            fs::remove_file(&backup_binary).map_err(|e| AppError::io(&backup_binary, e))?;
-        }
-        if staged_binary.exists() {
-            fs::remove_file(&staged_binary).map_err(|e| AppError::io(&staged_binary, e))?;
-        }
+        remove_file_if_present(&backup_binary)?;
+        remove_file_if_present(&staged_binary)?;
 
         fs::copy(new_binary_path, &staged_binary)
             .map_err(|e| map_update_permission_error(&current_binary, e))?;
@@ -627,6 +643,14 @@ fn replace_current_binary(new_binary_path: &Path) -> Result<(), AppError> {
 
         let _ = fs::remove_file(&backup_binary);
         Ok(())
+    }
+}
+
+fn remove_file_if_present(path: &Path) -> Result<(), AppError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(AppError::io(path, err)),
     }
 }
 
@@ -798,5 +822,24 @@ mod tests {
     fn validate_target_tag_rejects_path_content() {
         let err = validate_target_tag("v4.6.3/../../evil").expect_err("must reject traversal");
         assert!(err.to_string().contains("forbidden"));
+    }
+
+    #[test]
+    fn validate_download_size_limit_accepts_limit_boundary() {
+        validate_download_size_limit(
+            MAX_RELEASE_ASSET_SIZE_BYTES,
+            "cc-switch-cli-linux-x64-musl.tar.gz",
+        )
+        .expect("size at limit should pass");
+    }
+
+    #[test]
+    fn validate_download_size_limit_rejects_oversized_asset() {
+        let err = validate_download_size_limit(
+            MAX_RELEASE_ASSET_SIZE_BYTES + 1,
+            "cc-switch-cli-linux-x64-musl.tar.gz",
+        )
+        .expect_err("size over limit should fail");
+        assert!(err.to_string().contains("too large"));
     }
 }
