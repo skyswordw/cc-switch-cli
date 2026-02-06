@@ -1,0 +1,295 @@
+use clap::Args;
+use serde::Deserialize;
+use std::fs;
+use std::path::{Path, PathBuf};
+#[cfg(not(windows))]
+use std::process::Command;
+
+use crate::cli::ui::{highlight, info, success};
+use crate::error::AppError;
+
+const REPO_URL: &str = env!("CARGO_PKG_REPOSITORY");
+const BINARY_NAME: &str = "cc-switch";
+
+#[derive(Args, Debug, Clone)]
+pub struct UpdateCommand {
+    /// Target version (example: v4.6.2). Defaults to latest release.
+    #[arg(long)]
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseInfo {
+    tag_name: String,
+}
+
+pub fn execute(cmd: UpdateCommand) -> Result<(), AppError> {
+    let current_version = env!("CARGO_PKG_VERSION");
+    let target_tag = resolve_target_tag(cmd.version.as_deref())?;
+    let target_version = target_tag.trim_start_matches('v');
+
+    if target_version == current_version {
+        println!(
+            "{}",
+            info(&format!("Already on latest version: v{current_version}"))
+        );
+        return Ok(());
+    }
+
+    let asset_name = release_asset_name()?;
+    let download_url = format!("{REPO_URL}/releases/download/{target_tag}/{asset_name}");
+
+    println!(
+        "{}",
+        highlight(&format!("Current version: v{current_version}"))
+    );
+    println!("{}", highlight(&format!("Updating to: {target_tag}")));
+    println!("{}", info(&format!("Downloading: {download_url}")));
+
+    let downloaded_archive = download_release_asset(&download_url, &asset_name)?;
+    let extracted_binary = extract_binary(&downloaded_archive)?;
+    replace_current_binary(&extracted_binary)?;
+
+    println!(
+        "{}",
+        success(&format!("Updated successfully to {target_tag}"))
+    );
+    println!(
+        "{}",
+        info("Run `cc-switch --version` to verify the installed version.")
+    );
+    Ok(())
+}
+
+fn run_async<T>(
+    fut: impl std::future::Future<Output = Result<T, AppError>>,
+) -> Result<T, AppError> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| AppError::Message(format!("Failed to create runtime: {e}")))?
+        .block_on(fut)
+}
+
+fn resolve_target_tag(version: Option<&str>) -> Result<String, AppError> {
+    match version.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(version) => Ok(normalize_tag(version)),
+        None => run_async(fetch_latest_release_tag()),
+    }
+}
+
+fn normalize_tag(version: &str) -> String {
+    if version.starts_with('v') {
+        version.to_string()
+    } else {
+        format!("v{version}")
+    }
+}
+
+async fn fetch_latest_release_tag() -> Result<String, AppError> {
+    let api_url =
+        format!("{REPO_URL}/releases/latest").replace("github.com", "api.github.com/repos");
+    let client = reqwest::Client::builder()
+        .build()
+        .map_err(|e| AppError::Message(format!("Failed to initialize HTTP client: {e}")))?;
+    let release = client
+        .get(api_url)
+        .header(reqwest::header::USER_AGENT, "cc-switch-cli-updater")
+        .send()
+        .await
+        .map_err(|e| AppError::Message(format!("Failed to query latest release: {e}")))?
+        .error_for_status()
+        .map_err(|e| AppError::Message(format!("Release API returned error: {e}")))?
+        .json::<ReleaseInfo>()
+        .await
+        .map_err(|e| AppError::Message(format!("Failed to parse latest release response: {e}")))?;
+    Ok(release.tag_name)
+}
+
+fn release_asset_name() -> Result<String, AppError> {
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+
+    let name = match (os, arch) {
+        ("macos", "x86_64") | ("macos", "aarch64") => "cc-switch-cli-darwin-universal.tar.gz",
+        ("linux", "x86_64") => "cc-switch-cli-linux-x64-musl.tar.gz",
+        ("linux", "aarch64") => "cc-switch-cli-linux-arm64-musl.tar.gz",
+        ("windows", "x86_64") => "cc-switch-cli-windows-x64.zip",
+        _ => {
+            return Err(AppError::Message(format!(
+                "Self-update is not supported for platform {os}/{arch}."
+            )));
+        }
+    };
+
+    Ok(name.to_string())
+}
+
+fn download_release_asset(url: &str, asset_name: &str) -> Result<PathBuf, AppError> {
+    run_async(async move {
+        let bytes = reqwest::Client::builder()
+            .build()
+            .map_err(|e| AppError::Message(format!("Failed to initialize HTTP client: {e}")))?
+            .get(url)
+            .header(reqwest::header::USER_AGENT, "cc-switch-cli-updater")
+            .send()
+            .await
+            .map_err(|e| AppError::Message(format!("Failed to download release asset: {e}")))?
+            .error_for_status()
+            .map_err(|e| AppError::Message(format!("Release asset request failed: {e}")))?
+            .bytes()
+            .await
+            .map_err(|e| AppError::Message(format!("Failed to read release asset body: {e}")))?;
+
+        let tmp_dir = std::env::temp_dir().join(format!("cc-switch-update-{}", std::process::id()));
+        fs::create_dir_all(&tmp_dir).map_err(|e| AppError::io(&tmp_dir, e))?;
+        let archive_path = tmp_dir.join(asset_name);
+        fs::write(&archive_path, &bytes).map_err(|e| AppError::io(&archive_path, e))?;
+        Ok(archive_path)
+    })
+}
+
+fn extract_binary(archive_path: &Path) -> Result<PathBuf, AppError> {
+    let extract_dir = archive_path
+        .parent()
+        .ok_or_else(|| AppError::Message("Invalid archive path".to_string()))?
+        .join("extracted");
+    fs::create_dir_all(&extract_dir).map_err(|e| AppError::io(&extract_dir, e))?;
+
+    if cfg!(windows) {
+        extract_zip_binary(archive_path, &extract_dir)
+    } else {
+        extract_tar_binary(archive_path, &extract_dir)
+    }
+}
+
+#[cfg(not(windows))]
+fn extract_tar_binary(archive_path: &Path, extract_dir: &Path) -> Result<PathBuf, AppError> {
+    let status = Command::new("tar")
+        .arg("-xzf")
+        .arg(archive_path)
+        .arg("-C")
+        .arg(extract_dir)
+        .status()
+        .map_err(|e| AppError::Message(format!("Failed to run tar for extraction: {e}")))?;
+
+    if !status.success() {
+        return Err(AppError::Message(
+            "Failed to extract release archive with tar.".to_string(),
+        ));
+    }
+
+    let binary_path = extract_dir.join(BINARY_NAME);
+    if !binary_path.exists() {
+        return Err(AppError::Message(format!(
+            "Extracted archive does not contain expected binary: {BINARY_NAME}"
+        )));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = fs::Permissions::from_mode(0o755);
+        fs::set_permissions(&binary_path, perms).map_err(|e| AppError::io(&binary_path, e))?;
+    }
+
+    Ok(binary_path)
+}
+
+#[cfg(not(windows))]
+fn extract_zip_binary(_archive_path: &Path, _extract_dir: &Path) -> Result<PathBuf, AppError> {
+    Err(AppError::Message(
+        "ZIP extraction is only supported on Windows.".to_string(),
+    ))
+}
+
+#[cfg(windows)]
+fn extract_zip_binary(archive_path: &Path, extract_dir: &Path) -> Result<PathBuf, AppError> {
+    let file = fs::File::open(archive_path).map_err(|e| AppError::io(archive_path, e))?;
+    let mut zip = zip::ZipArchive::new(file)
+        .map_err(|e| AppError::Message(format!("Failed to open ZIP archive: {e}")))?;
+
+    let mut entry = zip
+        .by_name("cc-switch.exe")
+        .map_err(|_| AppError::Message("ZIP archive does not contain cc-switch.exe".to_string()))?;
+
+    let binary_path = extract_dir.join("cc-switch.exe");
+    let mut output = fs::File::create(&binary_path).map_err(|e| AppError::io(&binary_path, e))?;
+    std::io::copy(&mut entry, &mut output)
+        .map_err(|e| AppError::Message(format!("Failed to extract binary from ZIP: {e}")))?;
+
+    Ok(binary_path)
+}
+
+#[cfg(windows)]
+fn extract_tar_binary(_archive_path: &Path, _extract_dir: &Path) -> Result<PathBuf, AppError> {
+    Err(AppError::Message(
+        "TAR extraction is not supported on Windows.".to_string(),
+    ))
+}
+
+fn replace_current_binary(new_binary_path: &Path) -> Result<(), AppError> {
+    let current_binary = std::env::current_exe().map_err(|e| {
+        AppError::Message(format!("Failed to resolve current executable path: {e}"))
+    })?;
+    let parent = current_binary.parent().ok_or_else(|| {
+        AppError::Message("Current executable path has no parent directory.".to_string())
+    })?;
+
+    let staged_binary = parent.join(format!("{BINARY_NAME}.new"));
+    let backup_binary = parent.join(format!("{BINARY_NAME}.old"));
+
+    if backup_binary.exists() {
+        fs::remove_file(&backup_binary).map_err(|e| AppError::io(&backup_binary, e))?;
+    }
+    if staged_binary.exists() {
+        fs::remove_file(&staged_binary).map_err(|e| AppError::io(&staged_binary, e))?;
+    }
+
+    fs::copy(new_binary_path, &staged_binary)
+        .map_err(|e| map_update_permission_error(&current_binary, e))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = fs::Permissions::from_mode(0o755);
+        fs::set_permissions(&staged_binary, perms)
+            .map_err(|e| map_update_permission_error(&current_binary, e))?;
+    }
+
+    fs::rename(&current_binary, &backup_binary)
+        .map_err(|e| map_update_permission_error(&current_binary, e))?;
+
+    if let Err(err) = fs::rename(&staged_binary, &current_binary) {
+        let _ = fs::rename(&backup_binary, &current_binary);
+        return Err(map_update_permission_error(&current_binary, err));
+    }
+
+    let _ = fs::remove_file(&backup_binary);
+    Ok(())
+}
+
+fn map_update_permission_error(target: &Path, err: std::io::Error) -> AppError {
+    if err.kind() == std::io::ErrorKind::PermissionDenied {
+        return AppError::Message(format!(
+            "Permission denied while updating {}. Re-run with elevated privileges (for example: sudo cc-switch update), or use your package manager update command.",
+            target.display()
+        ));
+    }
+    AppError::io(target, err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_tag_adds_prefix_when_missing() {
+        assert_eq!(normalize_tag("4.6.2"), "v4.6.2");
+    }
+
+    #[test]
+    fn normalize_tag_keeps_existing_prefix() {
+        assert_eq!(normalize_tag("v4.6.2"), "v4.6.2");
+    }
+}
